@@ -48,14 +48,20 @@ in the console and a timestamped log of every run.
    - **Extra on LOCAL** — local models not on the web cloud list.
    - **Common** — installed locally and on the web.
 5. **Write `run_cloud_models.bat`** — one `ollama run <model>` line per
-   extra-on-web model (`ollama pull <model>` with `--pull-only`).
+   extra-on-web model (`ollama pull <model>` with `--pull-only`). By default it
+   first prints a **PLANNED update** block listing exactly which models will be
+   added, then asks for confirmation (`[y/N]`, Enter = No) before overwriting the
+   file. Only a `y`/`yes` rewrites it; anything else (or non-interactive stdin)
+   leaves the existing script untouched. `--pull-only` skips the prompt and
+   regenerates directly, since that is an explicit request.
 6. **Write a timestamped run log** to `logs\` containing:
    - **ALL IN WEB** (deduplicated)
    - **ALL IN LOCAL**
    - **NEW IN WEB** (not installed locally)
    - **NEW IN LOCAL** (not on the web cloud list)
    - plus COMMON, an integrity summary (pages scanned, base models found,
-     duplicates removed, failed pages, inventory status), and summary counts.
+     duplicates removed, failed pages, inventory status), summary counts, and a
+     line recording whether `run_cloud_models.bat` was updated (`yes`/`no`).
 
 If either inventory **fails** (network error, HTTP failure, a partial page
 crawl, or `ollama list` errors), that failure is reported in the console and log
@@ -77,7 +83,12 @@ Or directly: `python ollama_sync.py [--web-only] [--no-close] [--pull-only]`
   as *skipped* — deliberately not checked — rather than *empty*).
 - `--no-close` — keep Ollama running even if this script started it.
 - `--pull-only` — generate `run_cloud_models.bat` using `ollama pull` (download
-  only) instead of `ollama run` (interactive chat).
+  only) instead of `ollama run` (interactive chat). Skips the confirmation prompt.
+
+Without `--pull-only`, the script lists the web-only models it would add and asks
+`Regenerate run_cloud_models.bat with these N web-only model(s)? [y/N] (Enter = No)` —
+press `y` to overwrite, or just press Enter / anything else to leave the existing
+script as-is.
 
 ## Testing models
 
@@ -98,7 +109,9 @@ shorter 120 s timeout. The reported elapsed time covers both attempts.
 
 The console output is colour-coded (Windows 10+ cmd): the per-model progress line
 shows the symbol + status coloured by result, and the summary counts and grouped
-lists use the same colours. Log files are written as plain text (no colour codes).
+lists use the same colours. Log files are written as plain text (no colour codes)
+but mirror the full report: per-model results (status, elapsed, reply snippet,
+error), the grouped model lists, and the summary counts.
 
 ```bat
 test_models.bat                 REM test every installed model

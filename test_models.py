@@ -296,7 +296,12 @@ def main(argv=None):
         f.write("OLLAMA MODEL TEST LOG\n")
         f.write(f"Timestamp: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Prompt   : {PROMPT}\n")
+        f.write(f"Parallel : {parallel}\n")
+        f.write(f"Models   : {len(results)}\n")
         f.write("=" * 72 + "\n\n")
+
+        f.write("PER-MODEL RESULTS\n")
+        f.write("-" * 40 + "\n")
         for m, r in sorted(results.items()):
             f.write(f"{m}\n")
             f.write(f"  status : {r['status']}\n")
@@ -306,6 +311,28 @@ def main(argv=None):
             if r["error"]:
                 f.write(f"  error  : {r['error']}\n")
             f.write("\n")
+
+        def log_group(title, group, color=None):
+            f.write(f"{title} ({len(group)}):\n")
+            if not group:
+                f.write("  (none)\n")
+                return
+            for m, r in sorted(group.items()):
+                sym, _ = status_symbol(r["status"])
+                extra = ""
+                if r["status"] == STATUS_SLOW:
+                    extra = f"  ({format_elapsed(r['elapsed'])})"
+                f.write(f"  {sym} {m}{extra}\n")
+                if r["snippet"]:
+                    f.write(f"      reply: {r['snippet']}\n")
+            f.write("\n")
+
+        log_group("FUNCTIONAL & READY TO USE", {**functional, **slow})
+        log_group("AVAILABLE BUT NEEDS SUBSCRIPTION/UPGRADE", subscription)
+        log_group("RETIRED (no longer served)", retired)
+        log_group("NOT WORKING", {**no_resp, **errors})
+        log_group("AVAILABLE BUT NOT INSTALLED", unavailable)
+
         f.write("=" * 72 + "\n")
         f.write("SUMMARY\n")
         f.write(f"Functional ready to use   : {len(functional)}\n")
@@ -315,6 +342,7 @@ def main(argv=None):
         f.write(f"Not working (no response) : {len(no_resp)}\n")
         f.write(f"Not working (error)       : {len(errors)}\n")
         f.write(f"Unavailable (not installed): {len(unavailable)}\n")
+        f.write(f"Total tested              : {len(results)}\n")
         f.write("END OF LOG\n")
     print(f"\nWrote test log -> {log_path}")
     return 0

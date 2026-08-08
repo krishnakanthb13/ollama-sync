@@ -476,7 +476,8 @@ def write_list_file(path, items):
             f.write(item + "\n")
 
 
-def write_run_log(local_rows, local_status, web_models, web_status, web_stats, log_path):
+def write_run_log(local_rows, local_status, web_models, web_status, web_stats, log_path,
+                  script_written=None):
     """Write a structured, timestamped log of the run."""
     local_names = [name for name, _, _ in local_rows]
     local_set = set(local_names)
@@ -495,6 +496,10 @@ def write_run_log(local_rows, local_status, web_models, web_status, web_stats, l
     lines.append(f"Common             : {len(common)}")
     lines.append(f"New in web         : {len(new_in_web)}")
     lines.append(f"New in local       : {len(new_in_local)}")
+    if script_written is True:
+        lines.append(f"Run script updated : yes ({len(new_in_web)} model(s))")
+    elif script_written is False:
+        lines.append("Run script updated : no (user declined / not regenerated)")
     lines.append("=" * 72)
 
     lines.append("")
@@ -569,7 +574,10 @@ def write_run_log(local_rows, local_status, web_models, web_status, web_stats, l
 
 
 def write_run_script(extra_models, pull_only=False):
-    """Write run_cloud_models.bat that runs/pulls every web-only model locally."""
+    """Write run_cloud_models.bat that runs/pulls every web-only model locally.
+
+    Returns True if the file was (re)written, False if it was skipped.
+    """
     command = "pull" if pull_only else "run"
     action_comment = ("REM and starts a chat session." if not pull_only
                       else "REM and downloads it. No chat session is started.")
@@ -591,8 +599,12 @@ def write_run_script(extra_models, pull_only=False):
     lines.append("")
     lines.append("REM All done. Press any key to close...")
     lines.append("pause")
-    with open(RUN_SCRIPT_PATH, "w", encoding="utf-8") as f:
+    # newline="" disables Windows text-mode translation, so the explicit \r\n
+    # stays as a single CRLF instead of becoming \r\r\n (which renders as a
+    # blank line after every line in cmd.exe).
+    with open(RUN_SCRIPT_PATH, "w", encoding="utf-8", newline="") as f:
         f.write("\r\n".join(lines) + "\r\n")
+    return True
 
 
 def print_diff(local_rows, local_status, web_models, web_status):
@@ -692,12 +704,36 @@ def main(argv=None):
 
     extra_web = print_diff(local_rows, local_status, web_models, web_status)
 
-    write_run_script(extra_web, pull_only=args.pull_only)
-    print(f"\nWrote run script -> {RUN_SCRIPT_PATH} ({len(extra_web)} model(s))"
-          f"{' [pull-only]' if args.pull_only else ''}")
+    if args.pull_only:
+        # --pull-only is an explicit "regenerate as pull" request — write it.
+        wrote_script = write_run_script(extra_web, pull_only=True)
+        print(f"\nWrote run script -> {RUN_SCRIPT_PATH} ({len(extra_web)} model(s)) [pull-only]")
+    else:
+        # Show exactly which models will be added, then ask before overwriting.
+        print("\n" + "=" * 72)
+        print("PLANNED run_cloud_models.bat update")
+        print("=" * 72)
+        if extra_web:
+            for m in extra_web:
+                print(f"  + {m}")
+        else:
+            print("  (no new web-only models — script would contain no model lines)")
+        try:
+            answer = input(f"\nRegenerate run_cloud_models.bat with these "
+                           f"{len(extra_web)} web-only model(s)? "
+                           f"[y/N] (Enter = No) ").strip().lower()
+        except EOFError:  # non-interactive stdin (piped input, CI, etc.)
+            answer = "n"
+        if answer in ("y", "yes"):
+            wrote_script = write_run_script(extra_web, pull_only=False)
+            print(f"Wrote run script -> {RUN_SCRIPT_PATH} ({len(extra_web)} model(s))")
+        else:
+            wrote_script = False
+            print(f"Skipped updating {RUN_SCRIPT_PATH} (existing script left as-is).")
 
     log_path = os.path.join(LOGS_DIR, f"ollama_sync_{timestamp_str()}.log")
-    write_run_log(local_rows, local_status, web_models, web_status, web_stats, log_path)
+    write_run_log(local_rows, local_status, web_models, web_status, web_stats, log_path,
+                  script_written=wrote_script)
     print(f"Wrote run log      -> {log_path}")
 
     print("\nDone.")
