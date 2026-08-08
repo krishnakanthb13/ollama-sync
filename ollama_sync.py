@@ -111,7 +111,7 @@ def start_ollama():
 def stop_ollama(pid=None):
     """Close Ollama; if a PID is given, only that process is terminated."""
     print("Closing Ollama..." if pid else "Closing Ollama (all instances)...")
-    targets = [f"/PID", str(pid)] if pid else ["/IM", "ollama.exe"]
+    targets = ["/PID", str(pid)] if pid else ["/IM", "ollama.exe"]
     try:
         subprocess.run(["taskkill", "/F", *targets],
                        creationflags=subprocess.CREATE_NO_WINDOW,
@@ -271,7 +271,7 @@ def http_get_with_backoff(url, *, params=None, max_retries=4, base_delay=1.5):
             time.sleep(wait)
         except requests.RequestException as e:
             if attempt == max_retries - 1:
-                raise
+                return None  # exhausted retries — honor the "None on failure" contract
             wait = base_delay * (2 ** attempt)
             print(f"    request error: {e}; retrying in {wait:.0f}s "
                   f"(attempt {attempt + 1}/{max_retries})")
