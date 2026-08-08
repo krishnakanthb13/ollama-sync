@@ -1,0 +1,21 @@
+# Logs
+logs/
+*.log
+
+# Outputs
+outputs/
+
+# Python cache & artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Environment variables & local settings
+.env
+.venv/
+env/
+venv/
+
+.commandcode/
