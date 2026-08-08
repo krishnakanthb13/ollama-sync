@@ -13,7 +13,7 @@ in the console and a timestamped log of every run.
 | `test_models.py` | Test every installed model with a `hi` prompt and classify it (functional / needs subscription / retired / not working / unavailable). Colored ✓/✗/⚠ output on the console. |
 | `run_sync.bat` | Launcher for `ollama_sync.py` — runs it, lists the log files, and keeps the window open with a key-press. |
 | `test_models.bat` | Launcher for `test_models.py` — runs it, lists the log files, and keeps the window open with a key-press. |
-| `run_cloud_models.bat` | Generated — one `ollama run <model>` per web-only model. |
+| `run_cloud_models.bat` | Generated — one `ollama run <model>` (or `ollama pull` with `--pull-only`) per web-only model. |
 | `outputs/web_cloud_models.txt` | Generated — deduplicated sorted list of web `:cloud` models. |
 | `outputs/local_models.txt` | Generated — sorted list of local models from `ollama list`. |
 | `logs/ollama_sync_<timestamp>.log` | Generated — every sync run writes a log here. |
@@ -32,10 +32,12 @@ in the console and a timestamped log of every run.
    (most reliable, real size/modified values), falling back to
    `ollama list --format json` and then plain `ollama list` text parsing.
 3. **Scrape web cloud models** — fetches `https://ollama.com/search?c=cloud&o=newest`
-   and walks the catalog page-by-page (`p=1, 2, …`) until a page adds no new
-   models, collects the `/library/<model>` base models, then visits each
+   and walks the catalog page-by-page (`p=1, 2, …`) until two consecutive pages
+   add no new models, collects the `/library/<model>` base models, then visits each
    model's `/library/<model>/tags` page and extracts every tag ending in `cloud`
    (e.g. `glm-5.2:cloud`, `deepseek-v4-flash:0731-cloud`, `gemma4:31b-cloud`).
+   If any search or tags page fails, the whole web inventory is reported as
+   `FAILED` (a partial crawl is not a complete inventory).
    *(Based on `unified_model_loading.py`; uses the hidden `<input class="command">`
    tag rows with a text-regex fallback, plus retries with exponential backoff and
    HTTP 429 handling.)*
@@ -45,7 +47,8 @@ in the console and a timestamped log of every run.
    - **Extra on WEB** — cloud models not installed locally.
    - **Extra on LOCAL** — local models not on the web cloud list.
    - **Common** — installed locally and on the web.
-5. **Write `run_cloud_models.bat`** — one `ollama run <model>` line per extra-on-web model.
+5. **Write `run_cloud_models.bat`** — one `ollama run <model>` line per
+   extra-on-web model (`ollama pull <model>` with `--pull-only`).
 6. **Write a timestamped run log** to `logs\` containing:
    - **ALL IN WEB** (deduplicated)
    - **ALL IN LOCAL**
@@ -54,9 +57,11 @@ in the console and a timestamped log of every run.
    - plus COMMON, an integrity summary (pages scanned, base models found,
      duplicates removed, failed pages, inventory status), and summary counts.
 
-If either inventory **fails** (network error, HTTP failure, or `ollama list`
-errors), that failure is reported in the console and log as `FAILED` — never
-silently treated as an empty list.
+If either inventory **fails** (network error, HTTP failure, a partial page
+crawl, or `ollama list` errors), that failure is reported in the console and log
+as `FAILED` — never silently treated as an empty list. `--web-only` records the
+local side as *skipped* (deliberately not checked), which is also distinct from
+*empty*.
 
 ## Usage
 
@@ -68,7 +73,8 @@ run_sync.bat --pull-only   REM generate run_cloud_models.bat with `ollama pull`
 
 Or directly: `python ollama_sync.py [--web-only] [--no-close] [--pull-only]`
 
-- `--web-only` — skip the local Ollama open/list/close (local side is empty).
+- `--web-only` — skip the local Ollama open/list/close (local side is recorded
+  as *skipped* — deliberately not checked — rather than *empty*).
 - `--no-close` — keep Ollama running even if this script started it.
 - `--pull-only` — generate `run_cloud_models.bat` using `ollama pull` (download
   only) instead of `ollama run` (interactive chat).
@@ -76,7 +82,9 @@ Or directly: `python ollama_sync.py [--web-only] [--no-close] [--pull-only]`
 ## Testing models
 
 `test_models.py` sends a `hi` prompt to every installed model via the Ollama API and
-classifies the result:
+classifies the result. Each model gets a generous first attempt (300 s) so a slow
+cold-start isn't misclassified as dead; if that times out, it retries once with a
+shorter 120 s timeout. The reported elapsed time covers both attempts.
 
 | Status | Symbol / colour | Meaning |
 | --- | --- | --- |
@@ -99,11 +107,18 @@ test_models.bat --only glm-5.2:cloud   REM test a single model
 test_models.bat --parallel 3    REM test 3 models concurrently (watch VRAM)
 ```
 
+`--parallel` above 4 prints a VRAM warning — concurrent large models can
+exhaust GPU memory. If the local model inventory cannot be read (`ollama list`
+fails), the test script aborts with a clear error and a non-zero exit code
+instead of pretending there are zero models.
+
 Each run writes a per-model log under `logs\`. When launched via the `.bat`, the
 window stays open until a key is pressed so the report can be read on screen.
 
 ## Requirements
 
+- Windows 10/11 (the lifecycle helpers use `tasklist` / `taskkill` /
+  `CREATE_NO_WINDOW`; Linux/macOS would need process-control changes)
 - Python 3.x
 - `requests`, `beautifulsoup4` (`pip install requests beautifulsoup4`)
 - Ollama CLI on `PATH`

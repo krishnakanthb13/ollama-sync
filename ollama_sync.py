@@ -21,6 +21,7 @@ Usage:
 
 import os
 import re
+import sys
 import time
 import json
 import shutil
@@ -281,9 +282,13 @@ def http_get_with_backoff(url, *, params=None, max_retries=4, base_delay=1.5):
 def get_base_models():
     """Get the list of base model names from the cloud search pages.
 
-    Walks the catalog page-by-page (`p=1, 2, ...`) until a page returns no new
+    Walks the catalog page-by-page (`p=1, 2, ...`) until pages stop adding new
     models or MAX_SEARCH_PAGES is reached. Returns (models, status) where status
     is "ok", "empty" or "failed".
+
+    Any page that fails mid-crawl makes the inventory incomplete, so the result
+    is "failed" (never "ok") whenever pages_failed > 0 — a partial list is not
+    a complete inventory.
     """
     base_models = set()
     pages_fetched = 0
@@ -292,6 +297,7 @@ def get_base_models():
         # "newest" order first, then the default order — both share pagination.
         for order in ("newest", None):
             page = 1
+            empty_streak = 0
             while page <= MAX_SEARCH_PAGES:
                 params = {"c": "cloud"}
                 if order:
@@ -317,8 +323,14 @@ def get_base_models():
                             found += 1
                     print(f"    page {page}: {found} new base model(s) "
                           f"({len(base_models)} total)")
+                    # Stop after 2 consecutive empty pages (tolerates a single
+                    # gap in the catalog without treating it as the end).
                     if found == 0:
-                        break  # no new models on this page — end of catalog
+                        empty_streak += 1
+                        if empty_streak >= 2:
+                            break
+                    else:
+                        empty_streak = 0
                     time.sleep(0.8)
                     page += 1
                 except Exception as e:
@@ -331,9 +343,12 @@ def get_base_models():
         print(f"Error fetching base models: {e}")
         return [], "failed", pages_fetched, pages_failed
 
-    if not base_models and pages_failed > 0:
-        return [], "failed", pages_fetched, pages_failed
-    status = "ok" if base_models else "empty"
+    if pages_failed > 0:
+        status = "failed"
+    elif base_models:
+        status = "ok"
+    else:
+        status = "empty"
     return list(base_models), status, pages_fetched, pages_failed
 
 
@@ -354,7 +369,8 @@ def get_cloud_tags_for_model(model_name):
             # which list every tag for the model.
             for elem in soup.select('input[class~="command"]'):
                 value = elem.get("value", "").strip()
-                if value and CLOUD_TAG_RE.match(value) and value.startswith(model_name.lower()):
+                if value and CLOUD_TAG_RE.match(value) \
+                        and value.lower().startswith(model_name.lower()):
                     cloud_tags.add(value)
 
             # Fall back to scraping tag text/anchors if the input rows were absent.
@@ -425,6 +441,12 @@ def scrape_web_cloud_models():
     if len(final) != len(all_cloud_models):
         duplicate_count += len(all_cloud_models) - len(final)
         print(f"  (collapsed {len(all_cloud_models) - len(final)} case-variant duplicate(s))")
+
+    # A failed tags page means we couldn't read that model's full tag list, so
+    # the inventory is incomplete — report FAILED, not ok.
+    if failed_models > 0:
+        status = "failed"
+        print(f"  {failed_models} model tag page(s) FAILED — inventory is incomplete.")
 
     stats = {
         "pages_fetched": pages_fetched,
@@ -532,6 +554,8 @@ def write_run_log(local_rows, local_status, web_models, web_status, web_stats, l
         problems.append("WEB inventory FAILED — results may be incomplete")
     if local_status == "failed":
         problems.append("LOCAL inventory FAILED — results may be incomplete")
+    if local_status == "skipped":
+        problems.append("LOCAL inventory SKIPPED (--web-only) — local side is unknown")
     if not problems:
         problems.append("OK — both inventories obtained")
     for p in problems:
@@ -547,15 +571,19 @@ def write_run_log(local_rows, local_status, web_models, web_status, web_stats, l
 def write_run_script(extra_models, pull_only=False):
     """Write run_cloud_models.bat that runs/pulls every web-only model locally."""
     command = "pull" if pull_only else "run"
+    action_comment = ("REM and starts a chat session." if not pull_only
+                      else "REM and downloads it. No chat session is started.")
+    switch_comment = ("REM To only pull without starting a chat, change `run` to `pull`."
+                      if not pull_only
+                      else "REM This script pulls only — no chat is started.")
     lines = [
         "@echo off",
         f"REM One `ollama {command}` per model that is available on the web as :cloud",
         "REM but is not installed locally. Each line pulls the model if needed",
-        "REM and starts a chat session." if not pull_only else
-        "REM and downloads it. No chat session is started.",
+        action_comment,
         "REM",
         "REM Usage: run_cloud_models.bat",
-        "REM To only pull without starting a chat, change `run` to `pull`.",
+        switch_comment,
         "",
     ]
     for model in extra_models:
@@ -628,7 +656,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Compare web :cloud models vs locally installed Ollama models.")
     parser.add_argument("--web-only", action="store_true",
-                        help="Skip local Ollama management/list (local side is empty).")
+                        help="Skip local Ollama management/list (local side is skipped).")
     parser.add_argument("--no-close", action="store_true",
                         help="Keep Ollama running even if this script started it.")
     parser.add_argument("--pull-only", action="store_true",
@@ -646,7 +674,7 @@ def main(argv=None):
     if args.web_only:
         print("\n[web-only mode] Skipping local Ollama management/list.")
         local_rows = []
-        local_status = "empty"
+        local_status = "skipped"  # deliberately not checked, not "empty"
     else:
         with manage_ollama(no_close=args.no_close):
             print("\n--- Reading local models (ollama list) ---")
@@ -680,5 +708,7 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\n\nInterrupted by user.")
+        sys.exit(130)
     except Exception as e:
         print(f"\n\nUnexpected error: {e}")
+        sys.exit(1)

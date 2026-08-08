@@ -2,7 +2,7 @@
 REM ============================================================
 REM  run_sync.bat - run the Ollama web-vs-local sync tool
 REM  Creates a timestamped log under logs\ for every run.
-REM  Usage: run_sync.bat [--web-only]
+REM  Usage: run_sync.bat [--web-only] [--no-close] [--pull-only]
 REM ============================================================
 setlocal
 

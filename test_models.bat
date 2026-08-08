@@ -3,6 +3,7 @@ REM ============================================================
 REM  test_models.bat - test every installed Ollama model with "hi"
 REM  Writes a timestamped log under logs\ for every run.
 REM  Usage: test_models.bat [--only <model>] [--limit N]
+REM         [--parallel N] [--no-close]
 REM ============================================================
 setlocal
 

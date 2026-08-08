@@ -114,10 +114,11 @@ def run_model_test(model, prompt=PROMPT):
 
     Uses a generous MODEL_START_TIMEOUT so a slow cold-start isn't misclassified
     as a timeout, then falls back to the faster REQUEST_TIMEOUT for retries.
+    elapsed_s is the TOTAL time across attempts (including retries).
     """
     timeout = MODEL_START_TIMEOUT
+    total_start = time.time()
     for attempt in range(2):
-        start = time.time()
         try:
             payload = {
                 "model": model,
@@ -127,7 +128,7 @@ def run_model_test(model, prompt=PROMPT):
             }
             resp = requests.post(f"{OLLAMA_API}/api/generate", json=payload,
                                  timeout=timeout)
-            elapsed = time.time() - start
+            elapsed = time.time() - total_start
             if resp.status_code == 200:
                 data = resp.json()
                 text = (data.get("response") or "").strip()
@@ -143,10 +144,10 @@ def run_model_test(model, prompt=PROMPT):
             if attempt == 0:
                 timeout = REQUEST_TIMEOUT  # already waited for cold start; retry briskly
                 continue
-            elapsed = time.time() - start
+            elapsed = time.time() - total_start
             return STATUS_NO_RESPONSE, "", elapsed, "timeout"
         except Exception as e:
-            elapsed = time.time() - start
+            elapsed = time.time() - total_start
             return STATUS_ERROR, "", elapsed, str(e)
 
 
@@ -211,6 +212,10 @@ def main(argv=None):
     no_close = args.no_close
     parallel = max(1, args.parallel or 1)
 
+    if parallel > 4:
+        print(paint("WARNING: --parallel {} is high — large models run concurrently "
+                    "and can exhaust VRAM. Consider lowering it.".format(parallel), YELLOW))
+
     print("=" * 72)
     print("OLLAMA MODEL TEST — one 'hi' prompt per installed model")
     print("=" * 72)
@@ -218,10 +223,16 @@ def main(argv=None):
     sync.ensure_logs_dir()
 
     with sync.manage_ollama(no_close=no_close):
+        rows, status = sync.get_local_ollama_models()
+        if status == "failed":
+            print(paint("\n✗ LOCAL MODEL INVENTORY FAILED", RED))
+            print("  Cannot safely run model tests — check that Ollama is running")
+            print("  and that `ollama list` works, then re-run.")
+            return 1
+        installed = {name for name, _, _ in rows}
+
         if only:
             # Test a single model; if it isn't installed yet, report as unavailable.
-            rows, _status = sync.get_local_ollama_models()
-            installed = {name for name, _, _ in rows}
             models = [only]
             print(f"\nTesting single model: {only}")
             if only not in installed:
@@ -231,7 +242,6 @@ def main(argv=None):
             else:
                 results = run_all_tests(models, parallel=parallel)
         else:
-            rows, _status = sync.get_local_ollama_models()
             models = [name for name, _, _ in rows]
             if limit is not None:
                 models = models[:limit]
@@ -307,12 +317,15 @@ def main(argv=None):
         f.write(f"Unavailable (not installed): {len(unavailable)}\n")
         f.write("END OF LOG\n")
     print(f"\nWrote test log -> {log_path}")
+    return 0
 
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main() or 0)
     except KeyboardInterrupt:
         print("\n\nInterrupted by user.")
+        sys.exit(130)
     except Exception as e:
         print(f"\n\nUnexpected error: {e}")
+        sys.exit(1)
