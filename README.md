@@ -135,3 +135,62 @@ window stays open until a key is pressed so the report can be read on screen.
 - Python 3.x
 - `requests`, `beautifulsoup4` (`pip install requests beautifulsoup4`)
 - Ollama CLI on `PATH`
+
+---
+
+C:\Users\ADMIN>ollama list
+NAME                               ID              SIZE    MODIFIED
+kimi-k3:cloud                      630e737485bd    -       16 hours ago
+gemma4:cloud                       ef09f235533c    -       16 hours ago
+deepseek-v4-flash:preview-cloud    5166728b9358    -       16 hours ago
+deepseek-v4-flash:0731-cloud       d3f1c8744721    -       16 hours ago
+glm-5.2:cloud                      ce8fd6f94793    -       6 weeks ago
+kimi-k2.7-code:cloud               eda07a659237    -       8 weeks ago
+nemotron-3-ultra:cloud             6d55374b63bb    -       2 months ago
+minimax-m3:cloud                   d03a959f45c0    -       2 months ago
+deepseek-v4-pro:cloud              22bfd5026abd    -       3 months ago
+deepseek-v4-flash:cloud            ea027821675c    -       3 months ago
+kimi-k2.6:cloud                    a90cd0d1590c    -       3 months ago
+glm-5.1:cloud                      59472abf9d0a    -       3 months ago
+gemma4:31b-cloud                   c382fbfbc73b    -       4 months ago
+minimax-m2.7:cloud                 06daa293c105    -       4 months ago
+nemotron-3-super:cloud             be3943c5a818    -       4 months ago
+qwen3.5:397b-cloud                 a7bf6f7891c3    -       5 months ago
+qwen3.5:cloud                      a7bf6f7891c3    -       5 months ago
+minimax-m2.5:cloud                 c0d5751c800f    -       5 months ago
+glm-5:cloud                        c313cd065935    -       5 months ago
+qwen3-coder-next:cloud             aa626c11ae8d    -       6 months ago
+kimi-k2.5:cloud                    6d1c3246c608    -       6 months ago
+glm-4.7:cloud                      023608864819    -       7 months ago
+minimax-m2.1:cloud                 4ada3a038304    -       7 months ago
+gemini-3-flash-preview:latest      ebade0d31690    -       7 months ago
+gemini-3-flash-preview:cloud       436200142af2    -       7 months ago
+nemotron-3-nano:30b-cloud          01d0d069a149    -       7 months ago
+gemini-3-pro-preview:latest        91a1db042ba1    -       7 months ago
+rnj-1:8b-cloud                     d8200a2fbf21    -       7 months ago
+devstral-small-2:24b-cloud         ec4a591da58a    -       7 months ago
+devstral-2:123b-cloud              d37aca5b6a27    -       7 months ago
+qwen3-next:80b-cloud               f5ccd68d2872    -       7 months ago
+gemma3:27b-cloud                   9e1580299085    -       7 months ago
+gemma3:12b-cloud                   485e7119a53a    -       7 months ago
+gemma3:4b-cloud                    89c58fea5420    -       7 months ago
+deepseek-v3.2:cloud                55f7c48fb187    -       7 months ago
+mistral-large-3:675b-cloud         3130fd5a5a1e    -       7 months ago
+ministral-3:14b-cloud              615c59440878    -       7 months ago
+ministral-3:8b-cloud               a56a5396dfb9    -       7 months ago
+ministral-3:3b-cloud               6938c17dead4    -       7 months ago
+cogito-2.1:671b-cloud              36c90b0682ed    -       7 months ago
+qwen3-vl:235b-instruct-cloud       2bf9522f6961    -       7 months ago
+deepseek-v3.1:671b-cloud           d3749919e45f    -       7 months ago
+gpt-oss:20b-cloud                  875e8e3a629a    -       7 months ago
+glm-4.6:cloud                      05277b76269f    -       7 months ago
+kimi-k2-thinking:cloud             9752ffb77f53    -       7 months ago
+minimax-m2:cloud                   698ab6d56142    -       7 months ago
+qwen3-coder:480b-cloud             e30e45586389    -       7 months ago
+kimi-k2:1t-cloud                   20dc43ca06d7    -       7 months ago
+qwen3-vl:235b-cloud                86b3322ec200    -       7 months ago
+gpt-oss:120b-cloud                 569662207105    -       7 months ago
+
+C:\Users\ADMIN>
+
+---
