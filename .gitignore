@@ -3,7 +3,7 @@ logs/
 *.log
 
 # Outputs
-outputs/
+# outputs/
 
 # Python cache & artifacts
 __pycache__/

@@ -19,6 +19,48 @@ in the console and a timestamped log of every run.
 | `logs/ollama_sync_<timestamp>.log` | Generated — every sync run writes a log here. |
 | `logs/model_test_<timestamp>.log` | Generated — every model test run writes a log here. |
 
+## File call graph
+
+```mermaid
+flowchart TD
+    %% ── Launchers ──
+    RS["run_sync.bat<br/><i>launcher</i>"] --> OS["ollama_sync.py :: main()"]
+    TM["test_models.bat<br/><i>launcher</i>"] --> TP["test_models.py :: main()"]
+    RC["run_cloud_models.bat<br/><i>GENERATED</i><br/>ollama run / pull per web-only model"] -.->|user runs manually| OLLAMA_CLI2[["ollama CLI"]]
+
+    %% ── ollama_sync.py ──
+    OS --> MO["manage_ollama()<br/>is_ollama_running → start_ollama → stop_ollama<br/>tasklist / ollama serve / taskkill<br/>poll http://localhost:11434/api/tags"]
+    MO --> GL["get_local_ollama_models()<br/>1. GET /api/tags<br/>2. ollama list --format json<br/>3. ollama list text parse"]
+    OS --> WS["scrape_web_cloud_models()<br/>get_base_models() + get_cloud_tags_for_model()"]
+    WS --> HB["http_get_with_backoff()<br/>GET https://ollama.com/search?c=cloud&amp;o=newest&amp;p=N<br/>GET https://ollama.com/library/&lt;model&gt;/tags<br/>+ retries / 429 backoff"]
+    GL --> DF["print_diff()<br/>Extra on WEB / Extra on LOCAL / Common"]
+    WS --> DF
+    DF --> WR["write_run_script()<br/>extra_web → run_cloud_models.bat"]
+    WR --> RC
+    OS --> WL["write_list_file() + write_run_log()"]
+    WL --> OUT1["outputs/web_cloud_models.txt<br/><i>GENERATED</i>"]
+    WL --> OUT2["outputs/local_models.txt<br/><i>GENERATED</i>"]
+    WL --> OUT3["logs/ollama_sync_&lt;timestamp&gt;.log<br/><i>GENERATED</i>"]
+
+    %% ── test_models.py ──
+    TP --> IJ["import ollama_sync<br/>manage_ollama() + get_local_ollama_models()<br/>ensure_logs_dir()"]
+    IJ --> MO
+    IJ --> GL
+    IJ --> RT["run_all_tests() → run_model_test()<br/>POST http://localhost:11434/api/generate<br/>prompt='hi' — 300s then 120s retry"]
+    RT --> API[["Ollama API<br/>http://localhost:11434"]]
+    RT --> LOG2["logs/model_test_&lt;timestamp&gt;.log<br/><i>GENERATED</i>"]
+
+    %% ── external ──
+    GL -.-> API
+    HB -.-> WEB[["ollama.com"]]
+
+    style RC fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style OUT1 fill:#fff3e0,stroke:#ef6c00
+    style OUT2 fill:#fff3e0,stroke:#ef6c00
+    style OUT3 fill:#fce4ec,stroke:#c2185b
+    style LOG2 fill:#fce4ec,stroke:#c2185b
+```
+
 ## How the sync works
 
 1. **Manage Ollama** — checks `tasklist` for `ollama.exe` / `ollama app.exe`.
@@ -140,56 +182,59 @@ window stays open until a key is pressed so the report can be read on screen.
 
 C:\Users\ADMIN>ollama list
 NAME                               ID              SIZE    MODIFIED
-kimi-k3:cloud                      630e737485bd    -       16 hours ago
-gemma4:cloud                       ef09f235533c    -       16 hours ago
-deepseek-v4-flash:preview-cloud    5166728b9358    -       16 hours ago
-deepseek-v4-flash:0731-cloud       d3f1c8744721    -       16 hours ago
-glm-5.2:cloud                      ce8fd6f94793    -       6 weeks ago
-kimi-k2.7-code:cloud               eda07a659237    -       8 weeks ago
+glm-5.3:cloud                      8477dab3e25b    -       About a minute ago
+glm-5.3-flash:cloud                3e780905abc0    -       About a minute ago
+deepseek-v4-pro:0813-cloud         47d1ad2bea02    -       About a minute ago
+kimi-k3:cloud                      630e737485bd    -       2 weeks ago
+gemma4:cloud                       ef09f235533c    -       2 weeks ago
+deepseek-v4-flash:preview-cloud    5166728b9358    -       2 weeks ago
+deepseek-v4-flash:0731-cloud       d3f1c8744721    -       2 weeks ago
+glm-5.2:cloud                      ce8fd6f94793    -       2 months ago
+kimi-k2.7-code:cloud               eda07a659237    -       2 months ago
 nemotron-3-ultra:cloud             6d55374b63bb    -       2 months ago
 minimax-m3:cloud                   d03a959f45c0    -       2 months ago
-deepseek-v4-pro:cloud              22bfd5026abd    -       3 months ago
-deepseek-v4-flash:cloud            ea027821675c    -       3 months ago
-kimi-k2.6:cloud                    a90cd0d1590c    -       3 months ago
-glm-5.1:cloud                      59472abf9d0a    -       3 months ago
+deepseek-v4-pro:cloud              22bfd5026abd    -       4 months ago
+deepseek-v4-flash:cloud            ea027821675c    -       4 months ago
+kimi-k2.6:cloud                    a90cd0d1590c    -       4 months ago
+glm-5.1:cloud                      59472abf9d0a    -       4 months ago
 gemma4:31b-cloud                   c382fbfbc73b    -       4 months ago
-minimax-m2.7:cloud                 06daa293c105    -       4 months ago
-nemotron-3-super:cloud             be3943c5a818    -       4 months ago
-qwen3.5:397b-cloud                 a7bf6f7891c3    -       5 months ago
-qwen3.5:cloud                      a7bf6f7891c3    -       5 months ago
-minimax-m2.5:cloud                 c0d5751c800f    -       5 months ago
-glm-5:cloud                        c313cd065935    -       5 months ago
+minimax-m2.7:cloud                 06daa293c105    -       5 months ago
+nemotron-3-super:cloud             be3943c5a818    -       5 months ago
+qwen3.5:397b-cloud                 a7bf6f7891c3    -       6 months ago
+qwen3.5:cloud                      a7bf6f7891c3    -       6 months ago
+minimax-m2.5:cloud                 c0d5751c800f    -       6 months ago
+glm-5:cloud                        c313cd065935    -       6 months ago
 qwen3-coder-next:cloud             aa626c11ae8d    -       6 months ago
-kimi-k2.5:cloud                    6d1c3246c608    -       6 months ago
-glm-4.7:cloud                      023608864819    -       7 months ago
-minimax-m2.1:cloud                 4ada3a038304    -       7 months ago
-gemini-3-flash-preview:latest      ebade0d31690    -       7 months ago
-gemini-3-flash-preview:cloud       436200142af2    -       7 months ago
-nemotron-3-nano:30b-cloud          01d0d069a149    -       7 months ago
-gemini-3-pro-preview:latest        91a1db042ba1    -       7 months ago
-rnj-1:8b-cloud                     d8200a2fbf21    -       7 months ago
-devstral-small-2:24b-cloud         ec4a591da58a    -       7 months ago
-devstral-2:123b-cloud              d37aca5b6a27    -       7 months ago
-qwen3-next:80b-cloud               f5ccd68d2872    -       7 months ago
-gemma3:27b-cloud                   9e1580299085    -       7 months ago
-gemma3:12b-cloud                   485e7119a53a    -       7 months ago
-gemma3:4b-cloud                    89c58fea5420    -       7 months ago
-deepseek-v3.2:cloud                55f7c48fb187    -       7 months ago
-mistral-large-3:675b-cloud         3130fd5a5a1e    -       7 months ago
-ministral-3:14b-cloud              615c59440878    -       7 months ago
-ministral-3:8b-cloud               a56a5396dfb9    -       7 months ago
-ministral-3:3b-cloud               6938c17dead4    -       7 months ago
-cogito-2.1:671b-cloud              36c90b0682ed    -       7 months ago
-qwen3-vl:235b-instruct-cloud       2bf9522f6961    -       7 months ago
-deepseek-v3.1:671b-cloud           d3749919e45f    -       7 months ago
-gpt-oss:20b-cloud                  875e8e3a629a    -       7 months ago
-glm-4.6:cloud                      05277b76269f    -       7 months ago
-kimi-k2-thinking:cloud             9752ffb77f53    -       7 months ago
-minimax-m2:cloud                   698ab6d56142    -       7 months ago
-qwen3-coder:480b-cloud             e30e45586389    -       7 months ago
-kimi-k2:1t-cloud                   20dc43ca06d7    -       7 months ago
-qwen3-vl:235b-cloud                86b3322ec200    -       7 months ago
-gpt-oss:120b-cloud                 569662207105    -       7 months ago
+kimi-k2.5:cloud                    6d1c3246c608    -       7 months ago
+glm-4.7:cloud                      023608864819    -       8 months ago
+minimax-m2.1:cloud                 4ada3a038304    -       8 months ago
+gemini-3-flash-preview:latest      ebade0d31690    -       8 months ago
+gemini-3-flash-preview:cloud       436200142af2    -       8 months ago
+nemotron-3-nano:30b-cloud          01d0d069a149    -       8 months ago
+gemini-3-pro-preview:latest        91a1db042ba1    -       8 months ago
+rnj-1:8b-cloud                     d8200a2fbf21    -       8 months ago
+devstral-small-2:24b-cloud         ec4a591da58a    -       8 months ago
+devstral-2:123b-cloud              d37aca5b6a27    -       8 months ago
+qwen3-next:80b-cloud               f5ccd68d2872    -       8 months ago
+gemma3:27b-cloud                   9e1580299085    -       8 months ago
+gemma3:12b-cloud                   485e7119a53a    -       8 months ago
+gemma3:4b-cloud                    89c58fea5420    -       8 months ago
+deepseek-v3.2:cloud                55f7c48fb187    -       8 months ago
+mistral-large-3:675b-cloud         3130fd5a5a1e    -       8 months ago
+ministral-3:14b-cloud              615c59440878    -       8 months ago
+ministral-3:8b-cloud               a56a5396dfb9    -       8 months ago
+ministral-3:3b-cloud               6938c17dead4    -       8 months ago
+cogito-2.1:671b-cloud              36c90b0682ed    -       8 months ago
+qwen3-vl:235b-instruct-cloud       2bf9522f6961    -       8 months ago
+deepseek-v3.1:671b-cloud           d3749919e45f    -       8 months ago
+gpt-oss:20b-cloud                  875e8e3a629a    -       8 months ago
+glm-4.6:cloud                      05277b76269f    -       8 months ago
+kimi-k2-thinking:cloud             9752ffb77f53    -       8 months ago
+minimax-m2:cloud                   698ab6d56142    -       8 months ago
+qwen3-coder:480b-cloud             e30e45586389    -       8 months ago
+kimi-k2:1t-cloud                   20dc43ca06d7    -       8 months ago
+qwen3-vl:235b-cloud                86b3322ec200    -       8 months ago
+gpt-oss:120b-cloud                 569662207105    -       8 months ago
 
 C:\Users\ADMIN>
 
