@@ -6,9 +6,14 @@ REM
 REM Usage: run_cloud_models.bat
 REM To only pull without starting a chat, change `run` to `pull`.
 
-ollama run deepseek-v4-pro:0813-cloud
-ollama run glm-5.3-flash:cloud
-ollama run glm-5.3:cloud
+ollama run beam:cloud
+ollama run clef:27b-cloud
+ollama run clef:cloud
+ollama run deepseek-v4.1-flash:1017-cloud
+ollama run deepseek-v4.1-flash:cloud
+ollama run minimax-m3.1-flash:cloud
+ollama run mistral-large-4:cloud
+ollama run muse-spark-open:cloud
 
 REM All done. Press any key to close...
 pause
