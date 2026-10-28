@@ -11,6 +11,14 @@ __pycache__/
 *.pyo
 *.pyd
 .pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Backups & local scratch files
+*.bak
+*.orig
+.tmp-*
 
 # Environment variables & local settings
 .env

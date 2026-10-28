@@ -1,3 +1,6 @@
+beam:cloud
+clef:27b-cloud
+clef:cloud
 cogito-2.1:671b-cloud
 deepseek-v3.1:671b-cloud
 deepseek-v3.2:cloud
@@ -6,6 +9,8 @@ deepseek-v4-flash:cloud
 deepseek-v4-flash:preview-cloud
 deepseek-v4-pro:0813-cloud
 deepseek-v4-pro:cloud
+deepseek-v4.1-flash:1017-cloud
+deepseek-v4.1-flash:cloud
 devstral-2:123b-cloud
 devstral-small-2:24b-cloud
 gemini-3-flash-preview:cloud
@@ -35,11 +40,14 @@ minimax-m2.1:cloud
 minimax-m2.5:cloud
 minimax-m2.7:cloud
 minimax-m2:cloud
+minimax-m3.1-flash:cloud
 minimax-m3:cloud
 ministral-3:14b-cloud
 ministral-3:3b-cloud
 ministral-3:8b-cloud
 mistral-large-3:675b-cloud
+mistral-large-4:cloud
+muse-spark-open:cloud
 nemotron-3-nano:30b-cloud
 nemotron-3-super:cloud
 nemotron-3-ultra:cloud

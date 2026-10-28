@@ -11,11 +11,14 @@ in the console and a timestamped log of every run.
 | --- | --- |
 | `ollama_sync.py` | Main tool: manage Ollama, scrape web `:cloud` models, diff vs local, write log + run script. |
 | `test_models.py` | Test every installed model with a `hi` prompt and classify it (functional / needs subscription / retired / not working / unavailable). Colored ✓/✗/⚠ output on the console. |
-| `run_sync.bat` | Launcher for `ollama_sync.py` — runs it, lists the log files, and keeps the window open with a key-press. |
-| `test_models.bat` | Launcher for `test_models.py` — runs it, lists the log files, and keeps the window open with a key-press. |
+| `run_sync.bat` | Launcher for `ollama_sync.py` — checks Python/dependencies, runs it, lists the log files, and keeps the window open with a key-press (skipped when `CI` is set). |
+| `test_models.bat` | Launcher for `test_models.py` — same checks, runs it, lists the log files, and keeps the window open with a key-press (skipped when `CI` is set). |
 | `run_cloud_models.bat` | Generated — one `ollama run <model>` (or `ollama pull` with `--pull-only`) per web-only model. |
 | `outputs/web_cloud_models.txt` | Generated — deduplicated sorted list of web `:cloud` models. |
 | `outputs/local_models.txt` | Generated — sorted list of local models from `ollama list`. |
+| `requirements.txt` | Runtime dependencies (`requests`, `beautifulsoup4`). |
+| `requirements-dev.txt` | Development dependencies (`pytest`, `ruff`) on top of the runtime ones. |
+| `tests/` | Offline unit tests (`python -m pytest tests -q`). |
 | `logs/ollama_sync_<timestamp>.log` | Generated — every sync run writes a log here. |
 | `logs/model_test_<timestamp>.log` | Generated — every model test run writes a log here. |
 
@@ -32,7 +35,7 @@ flowchart TD
     OS --> MO["manage_ollama()<br/>is_ollama_running → start_ollama → stop_ollama<br/>tasklist / ollama serve / taskkill<br/>poll http://localhost:11434/api/tags"]
     MO --> GL["get_local_ollama_models()<br/>1. GET /api/tags<br/>2. ollama list --format json<br/>3. ollama list text parse"]
     OS --> WS["scrape_web_cloud_models()<br/>get_base_models() + get_cloud_tags_for_model()"]
-    WS --> HB["http_get_with_backoff()<br/>GET https://ollama.com/search?c=cloud&amp;o=newest&amp;p=N<br/>GET https://ollama.com/library/&lt;model&gt;/tags<br/>+ retries / 429 backoff"]
+    WS --> HB["http_get_with_backoff()<br/>GET https://ollama.com/search?c=cloud&amp;o=newest&amp;page=N<br/>GET https://ollama.com/library/&lt;model&gt;/tags<br/>+ 429/5xx retries, no retry on 4xx"]
     GL --> DF["print_diff()<br/>Extra on WEB / Extra on LOCAL / Common"]
     WS --> DF
     DF --> WR["write_run_script()<br/>extra_web → run_cloud_models.bat"]
@@ -71,18 +74,26 @@ flowchart TD
    If Ollama was already running, it is left untouched.
    *(Mirrors `core_value_providers.manage_ollama`.)*
 2. **Read local models** — queries the Ollama REST API (`/api/tags`) first
-   (most reliable, real size/modified values), falling back to
-   `ollama list --format json` and then plain `ollama list` text parsing.
+   (most reliable, real size/modified values, and works without the CLI), falling
+   back to `ollama list --format json` and then plain `ollama list` text parsing.
+   Payloads are schema-validated: a malformed response (for example
+   `{"models": null}`) is a failure that triggers the fallback, never an empty
+   inventory. Subprocesses have timeouts.
 3. **Scrape web cloud models** — fetches `https://ollama.com/search?c=cloud&o=newest`
-   and walks the catalog page-by-page (`p=1, 2, …`) until two consecutive pages
-   add no new models, collects the `/library/<model>` base models, then visits each
-   model's `/library/<model>/tags` page and extracts every tag ending in `cloud`
+   and follows the site's real pagination: `page=2, 3, …` with the `HX-Request:
+   true` header, stopping when `data-has-more` is absent. It collects the
+   `/library/<model>` base models, then visits each model's
+   `/library/<model>/tags` page and extracts every tag ending in `cloud`
    (e.g. `glm-5.2:cloud`, `deepseek-v4-flash:0731-cloud`, `gemma4:31b-cloud`).
-   If any search or tags page fails, the whole web inventory is reported as
-   `FAILED` (a partial crawl is not a complete inventory).
+   Tags must match the base model name **exactly**, so `foo-bar:cloud` can never
+   be attributed to `foo`. A 404 tags page means "no cloud variants"; any other
+   failed page makes the whole web inventory `FAILED` (a partial crawl is not a
+   complete inventory). Hitting the page cap or the 10-minute crawl deadline
+   reports `TRUNCATED`.
    *(Based on `unified_model_loading.py`; uses the hidden `<input class="command">`
-   tag rows with a text-regex fallback, plus retries with exponential backoff and
-   HTTP 429 handling.)*
+   tag rows with a text-regex fallback. Retries cover timeouts, 429 and 5xx only —
+   4xx responses such as 404 are not retried — with jittered exponential backoff,
+   `Retry-After` support, and a 60 s cap on any single wait.)*
    **No duplicates**: tags are collected into a `set`, cross-model duplicates are
    reported and kept once, and the final list is case-insensitively deduplicated.
 4. **Show the difference** — prints:
@@ -96,6 +107,11 @@ flowchart TD
    file. Only a `y`/`yes` rewrites it; anything else (or non-interactive stdin)
    leaves the existing script untouched. `--pull-only` skips the prompt and
    regenerates directly, since that is an explicit request.
+   The script is only generated from **two complete inventories** (web `ok`,
+   local `ok`/`empty`). It is never written when the web inventory is `failed`,
+   `truncated` or `empty`, when the local inventory failed, or in `--web-only`
+   mode. An empty model list never overwrites an existing script, and scraped
+   names that are not safe for a batch file are rejected.
 6. **Write a timestamped run log** to `logs\` containing:
    - **ALL IN WEB** (deduplicated)
    - **ALL IN LOCAL**
@@ -105,11 +121,22 @@ flowchart TD
      duplicates removed, failed pages, inventory status), summary counts, and a
      line recording whether `run_cloud_models.bat` was updated (`yes`/`no`).
 
-If either inventory **fails** (network error, HTTP failure, a partial page
-crawl, or `ollama list` errors), that failure is reported in the console and log
-as `FAILED` — never silently treated as an empty list. `--web-only` records the
-local side as *skipped* (deliberately not checked), which is also distinct from
-*empty*.
+Inventories are status-tagged: `ok`, `empty` (obtained, but no models),
+`failed` (could not be obtained), `truncated` (page/time limit reached) and
+`skipped` (`--web-only`). Only `ok`/`empty` inventories update
+`outputs/web_cloud_models.txt` and `outputs/local_models.txt`; a failed,
+truncated or skipped inventory leaves the tracked output file untouched. The
+same failure is reported in the console and log — never silently treated as an
+empty list.
+
+Exit codes:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Complete run (both inventories ok/empty; local may be skipped with `--web-only`). |
+| `1` | Incomplete or unusable inventory, or an unexpected error. |
+| `2` | Invalid command-line arguments. |
+| `130` | Interrupted with Ctrl+C. |
 
 ## Usage
 
@@ -119,7 +146,12 @@ run_sync.bat --web-only    REM skip local Ollama management/list
 run_sync.bat --pull-only   REM generate run_cloud_models.bat with `ollama pull`
 ```
 
-Or directly: `python ollama_sync.py [--web-only] [--no-close] [--pull-only]`
+Or directly: `python ollama_sync.py [--web-only] [--no-close] [--pull-only] [--version]`
+
+The `.bat` launchers check for Python 3.8+, `requests`/`beautifulsoup4`, and (for
+`run_sync.bat`) Ollama on `PATH` before starting. `run_sync.bat --web-only`
+skips the Ollama check because it never touches the local side. Set `CI=1` to
+disable the final "press any key" pause in non-interactive environments.
 
 - `--web-only` — skip the local Ollama open/list/close (local side is recorded
   as *skipped* — deliberately not checked — rather than *empty*).
@@ -145,15 +177,23 @@ shorter 120 s timeout. The reported elapsed time covers both attempts.
 | `functional (slow)` | ✓ cyan | Responded, but took > 60s. |
 | `needs subscription` | ⚠ yellow | Model exists but requires an Ollama subscription/upgrade (HTTP 401/403). Not usable without upgrading. |
 | `retired (410 gone)` | ✗ gray | Model is no longer served by Ollama's cloud (HTTP 410). Not usable. |
-| `not working (no response)` | ✗ red | Timed out or returned an empty reply. |
-| `not working (error)` | ✗ red | Request failed for another reason. |
+| `not working (no response)` | ✗ red | Timed out, or returned neither visible text nor reasoning output. |
+| `not working (error)` | ✗ red | Request failed for another reason (including HTTP 404 and 429). |
 | `unavailable (not installed)` | – magenta | Requested via `--only` but not present locally. |
 
-The console output is colour-coded (Windows 10+ cmd): the per-model progress line
-shows the symbol + status coloured by result, and the summary counts and grouped
-lists use the same colours. Log files are written as plain text (no colour codes)
-but mirror the full report: per-model results (status, elapsed, reply snippet,
-error), the grouped model lists, and the summary counts.
+Reasoning models sometimes return an empty `response` while putting the whole
+reply in Ollama's `thinking` field (often with `done_reason="length"`). Those are
+reported as **functional** with a `[reasoning] …` snippet, not as dead models.
+Malformed JSON responses are reported as errors.
+
+The console output is colour-coded only on a real terminal (Windows 10+ cmd):
+the per-model progress line shows the symbol + status coloured by result, and the
+summary counts and grouped lists use the same colours. Set `NO_COLOR=1` or run
+without a console (CI, redirected output) to get plain text. Log files are
+written as UTF-8 with a BOM (so Notepad detects the encoding), contain no colour
+codes, and mirror the full report: per-model results (status, elapsed, reply
+snippet, error), the grouped model lists, and the summary counts. Logs are
+written atomically, so an interrupted run cannot leave a half-written file.
 
 ```bat
 test_models.bat                 REM test every installed model
@@ -174,68 +214,23 @@ window stays open until a key is pressed so the report can be read on screen.
 
 - Windows 10/11 (the lifecycle helpers use `tasklist` / `taskkill` /
   `CREATE_NO_WINDOW`; Linux/macOS would need process-control changes)
-- Python 3.x
-- `requests`, `beautifulsoup4` (`pip install requests beautifulsoup4`)
-- Ollama CLI on `PATH`
+- Python 3.8 or newer
+- `requests`, `beautifulsoup4` (`python -m pip install -r requirements.txt`)
+- Ollama CLI on `PATH` (not needed for `--web-only`; the REST API alone is
+  enough when Ollama is already running)
+
+## Development
+
+```bat
+python -m pip install -r requirements-dev.txt
+python -m pytest tests -q
+ruff check .
+```
+
+The tests are fully offline: they mock HTTP responses and use temporary
+directories, so no Ollama server or network access is required.
 
 ---
 
-C:\Users\ADMIN>ollama list
-NAME                               ID              SIZE    MODIFIED
-glm-5.3:cloud                      8477dab3e25b    -       About a minute ago
-glm-5.3-flash:cloud                3e780905abc0    -       About a minute ago
-deepseek-v4-pro:0813-cloud         47d1ad2bea02    -       About a minute ago
-kimi-k3:cloud                      630e737485bd    -       2 weeks ago
-gemma4:cloud                       ef09f235533c    -       2 weeks ago
-deepseek-v4-flash:preview-cloud    5166728b9358    -       2 weeks ago
-deepseek-v4-flash:0731-cloud       d3f1c8744721    -       2 weeks ago
-glm-5.2:cloud                      ce8fd6f94793    -       2 months ago
-kimi-k2.7-code:cloud               eda07a659237    -       2 months ago
-nemotron-3-ultra:cloud             6d55374b63bb    -       2 months ago
-minimax-m3:cloud                   d03a959f45c0    -       2 months ago
-deepseek-v4-pro:cloud              22bfd5026abd    -       4 months ago
-deepseek-v4-flash:cloud            ea027821675c    -       4 months ago
-kimi-k2.6:cloud                    a90cd0d1590c    -       4 months ago
-glm-5.1:cloud                      59472abf9d0a    -       4 months ago
-gemma4:31b-cloud                   c382fbfbc73b    -       4 months ago
-minimax-m2.7:cloud                 06daa293c105    -       5 months ago
-nemotron-3-super:cloud             be3943c5a818    -       5 months ago
-qwen3.5:397b-cloud                 a7bf6f7891c3    -       6 months ago
-qwen3.5:cloud                      a7bf6f7891c3    -       6 months ago
-minimax-m2.5:cloud                 c0d5751c800f    -       6 months ago
-glm-5:cloud                        c313cd065935    -       6 months ago
-qwen3-coder-next:cloud             aa626c11ae8d    -       6 months ago
-kimi-k2.5:cloud                    6d1c3246c608    -       7 months ago
-glm-4.7:cloud                      023608864819    -       8 months ago
-minimax-m2.1:cloud                 4ada3a038304    -       8 months ago
-gemini-3-flash-preview:latest      ebade0d31690    -       8 months ago
-gemini-3-flash-preview:cloud       436200142af2    -       8 months ago
-nemotron-3-nano:30b-cloud          01d0d069a149    -       8 months ago
-gemini-3-pro-preview:latest        91a1db042ba1    -       8 months ago
-rnj-1:8b-cloud                     d8200a2fbf21    -       8 months ago
-devstral-small-2:24b-cloud         ec4a591da58a    -       8 months ago
-devstral-2:123b-cloud              d37aca5b6a27    -       8 months ago
-qwen3-next:80b-cloud               f5ccd68d2872    -       8 months ago
-gemma3:27b-cloud                   9e1580299085    -       8 months ago
-gemma3:12b-cloud                   485e7119a53a    -       8 months ago
-gemma3:4b-cloud                    89c58fea5420    -       8 months ago
-deepseek-v3.2:cloud                55f7c48fb187    -       8 months ago
-mistral-large-3:675b-cloud         3130fd5a5a1e    -       8 months ago
-ministral-3:14b-cloud              615c59440878    -       8 months ago
-ministral-3:8b-cloud               a56a5396dfb9    -       8 months ago
-ministral-3:3b-cloud               6938c17dead4    -       8 months ago
-cogito-2.1:671b-cloud              36c90b0682ed    -       8 months ago
-qwen3-vl:235b-instruct-cloud       2bf9522f6961    -       8 months ago
-deepseek-v3.1:671b-cloud           d3749919e45f    -       8 months ago
-gpt-oss:20b-cloud                  875e8e3a629a    -       8 months ago
-glm-4.6:cloud                      05277b76269f    -       8 months ago
-kimi-k2-thinking:cloud             9752ffb77f53    -       8 months ago
-minimax-m2:cloud                   698ab6d56142    -       8 months ago
-qwen3-coder:480b-cloud             e30e45586389    -       8 months ago
-kimi-k2:1t-cloud                   20dc43ca06d7    -       8 months ago
-qwen3-vl:235b-cloud                86b3322ec200    -       8 months ago
-gpt-oss:120b-cloud                 569662207105    -       8 months ago
-
-C:\Users\ADMIN>
-
----
+<!-- Stale manual `ollama list` capture removed; use `outputs/local_models.txt`
+     or run `ollama list` for the current inventory. -->

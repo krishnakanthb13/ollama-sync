@@ -1,0 +1,7 @@
+# Batch files must keep CRLF line endings for cmd.exe.
+*.bat text eol=crlf
+# Python and docs use LF.
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.toml text eol=lf

@@ -15,7 +15,7 @@ Steps:
      all-in-web, all-in-local, new-in-web and new-in-local.
 
 Usage:
-  python ollama_sync.py [--web-only] [--no-close] [--pull-only]
+  python ollama_sync.py [--web-only] [--no-close] [--pull-only] [--version]
   run_sync.bat            (same, then points you at the log file)
 """
 
@@ -24,23 +24,57 @@ import re
 import sys
 import time
 import json
+import math
+import random
 import shutil
+import tempfile
 import datetime
 import subprocess
 from contextlib import contextmanager
+from email.utils import parsedate_to_datetime
+from urllib.parse import quote, unquote
 
 import requests
-from bs4 import BeautifulSoup
+
+__version__ = "0.0.8"
 
 BASE_URL = "https://ollama.com"
 SEARCH_URL = f"{BASE_URL}/search?c=cloud&o=newest"
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; ollama-sync/0.0.8)",
+    "Accept": "text/html,application/xhtml+xml",
+}
 REQUEST_TIMEOUT = 30
 MAX_SEARCH_PAGES = 50  # safety cap for search-catalog pagination
+MAX_CRAWL_SECONDS = 600
+MAX_RETRY_WAIT = 60.0
+MAX_BACKOFF = 30.0
+LOCAL_REQUEST_TIMEOUT = 10
+SUBPROCESS_TIMEOUT = 30
+OLLAMA_HOST = (os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434").strip()
+if "://" not in OLLAMA_HOST:
+    OLLAMA_HOST = "http://" + OLLAMA_HOST
+OLLAMA_HOST = OLLAMA_HOST.rstrip("/")
+OLLAMA_TAGS_URL = f"{OLLAMA_HOST}/api/tags"
+
+STATUS_OK = "ok"
+STATUS_EMPTY = "empty"
+STATUS_FAILED = "failed"
+STATUS_SKIPPED = "skipped"
+STATUS_TRUNCATED = "truncated"
 
 # Regex for a cloud tag, e.g. "glm-5.2:cloud", "deepseek-v4-flash:0731-cloud",
-# "gemma4:31b-cloud". Mirrors the reference implementation's pattern.
-CLOUD_TAG_RE = re.compile(r"^([\w\d.+-]+):([\w\d.+-]*cloud)$", re.IGNORECASE)
+# "gemma4:31b-cloud". Accept only ASCII model/tag characters so scraped names
+# can never inject commands into the generated .bat file.
+CLOUD_TAG_RE = re.compile(
+    r"^([A-Za-z0-9][A-Za-z0-9._+-]*):([A-Za-z0-9._+-]*cloud)$",
+    re.IGNORECASE | re.ASCII,
+)
+BASE_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$", re.ASCII)
+MODEL_NAME_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._+-]*(?::[A-Za-z0-9][A-Za-z0-9._+-]*)?$",
+    re.ASCII,
+)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUTPUTS_DIR = os.path.join(HERE, "outputs")
@@ -51,22 +85,87 @@ CLOUD_TXT = os.path.join(OUTPUTS_DIR, "web_cloud_models.txt")
 LOCAL_TXT = os.path.join(OUTPUTS_DIR, "local_models.txt")
 
 
+def _creation_flags():
+    """Windows-only process creation flag, safe to call on other platforms."""
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def _soup(html):
+    """Parse HTML, importing BeautifulSoup lazily so model tests don't need it."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError as exc:  # pragma: no cover - dependency failure
+        raise RuntimeError(
+            "beautifulsoup4 is required for web scraping "
+            "(pip install requests beautifulsoup4)"
+        ) from exc
+    return BeautifulSoup(html, "html.parser")
+
+
+def is_safe_model_name(name, allow_tag=True):
+    """Return True if *name* is safe to put in a URL/batch file."""
+    if not isinstance(name, str) or not name or len(name) > 200:
+        return False
+    pattern = MODEL_NAME_RE if allow_tag else BASE_MODEL_RE
+    return bool(pattern.fullmatch(name))
+
+
+def tag_belongs_to_model(tag, model_name):
+    """Return True only when the tag's base is exactly *model_name*."""
+    return tag.split(":", 1)[0].casefold() == model_name.casefold()
+
+
+def atomic_write_text(path, text, *, encoding="utf-8", newline=None):
+    """Write *text* atomically via a temporary file in the same directory."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp-", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding, newline=newline) as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def unique_path(path):
+    """Return *path*, or a numbered variant if it already exists."""
+    if not os.path.exists(path):
+        return path
+    stem, ext = os.path.splitext(path)
+    for i in range(1, 10000):
+        candidate = f"{stem}_{i}{ext}"
+        if not os.path.exists(candidate):
+            return candidate
+    return f"{stem}_{int(time.time() * 1000)}{ext}"
+
+
 def timestamp_str():
-    """Compact timestamp for file names, e.g. 20260808_143512."""
-    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    """Compact timestamp for file names, e.g. 20260808_143512_123456."""
+    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
 
 def format_size(size):
     """Human-readable size from a byte count, e.g. 5.4 GB."""
+    if size is None:
+        return "?"
     try:
         size = float(size)
     except (TypeError, ValueError):
         return str(size)
+    if not math.isfinite(size) or size < 0:
+        return "?"
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if size < 1024 or unit == "TB":
             return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} {unit}"
         size /= 1024
-    return str(size)
+    return "?"
 
 
 # =============================================================================
@@ -77,11 +176,24 @@ def ollama_on_path():
     return shutil.which("ollama") is not None
 
 
+def _ollama_api_ready(timeout=2.0):
+    """Return True if the Ollama HTTP API answers successfully."""
+    try:
+        resp = requests.get(OLLAMA_TAGS_URL, timeout=timeout)
+        return resp.status_code == 200
+    except requests.RequestException:
+        return False
+
+
 def is_ollama_running():
-    """Return True if an Ollama process is currently running."""
+    """Return True if the Ollama API is ready or an Ollama process exists."""
+    if _ollama_api_ready():
+        return True
     try:
         tasklist_output = subprocess.check_output(
-            ["tasklist"], creationflags=subprocess.CREATE_NO_WINDOW
+            ["tasklist"],
+            creationflags=_creation_flags(),
+            timeout=10,
         ).decode("utf-8", errors="ignore").lower()
         return "ollama.exe" in tasklist_output or "ollama app.exe" in tasklist_output
     except Exception as e:
@@ -89,37 +201,70 @@ def is_ollama_running():
         return False
 
 
+def wait_for_ollama(timeout_seconds=30.0):
+    """Wait until the Ollama API responds, returning True on success."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if _ollama_api_ready(timeout=2.0):
+            return True
+        time.sleep(0.5)
+    return False
+
+
 def start_ollama():
     """Start `ollama serve` and wait until it responds (or ~30s timeout)."""
+    if not ollama_on_path():
+        print("Error: `ollama` command not found on PATH. Cannot start Ollama.")
+        return None
     print("Ollama is not running. Starting Ollama...")
-    proc = subprocess.Popen(["ollama", "serve"], creationflags=subprocess.CREATE_NO_WINDOW)
+    try:
+        proc = subprocess.Popen(
+            ["ollama", "serve"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=_creation_flags(),
+        )
+    except OSError as e:
+        print(f"Could not start Ollama: {e}")
+        return None
     print("Waiting for Ollama to be ready...", end="", flush=True)
-    for _ in range(30):
-        try:
-            resp = requests.get("http://localhost:11434/api/tags", timeout=2)
-            if resp.status_code == 200:
-                print(" Ready!")
-                return proc.pid
-        except requests.RequestException:
-            pass
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        if _ollama_api_ready(timeout=2.0):
+            print(" Ready!")
+            return proc.pid
+        if proc.poll() is not None:
+            print(" Ollama exited before becoming ready.")
+            return None
         print(".", end="", flush=True)
-        time.sleep(1)
+        time.sleep(0.5)
     print(" Timeout waiting for Ollama. Query might fail.")
     return proc.pid
 
 
 def stop_ollama(pid=None):
-    """Close Ollama; if a PID is given, only that process is terminated."""
+    """Close Ollama; if a PID is given, only that process tree is terminated."""
     print("Closing Ollama..." if pid else "Closing Ollama (all instances)...")
     targets = ["/PID", str(pid)] if pid else ["/IM", "ollama.exe"]
     try:
-        subprocess.run(["taskkill", "/F", *targets],
-                       creationflags=subprocess.CREATE_NO_WINDOW,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        result = subprocess.run(
+            ["taskkill", "/F", "/T", *targets],
+            creationflags=_creation_flags(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
         if not pid:
-            subprocess.run(["taskkill", "/F", "/IM", "ollama app.exe"],
-                           creationflags=subprocess.CREATE_NO_WINDOW,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/IM", "ollama app.exe"],
+                creationflags=_creation_flags(),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        if result.returncode not in (0, 128):  # 128 = process already gone
+            print(f"Warning: taskkill returned exit code {result.returncode}.")
     except Exception as e:
         print(f"Could not close Ollama automatically: {e}")
 
@@ -129,12 +274,19 @@ def manage_ollama(no_close=False):
     """Ensure Ollama is running during the block; stop it after if this script started it."""
     started_pid = None
     try:
-        if not ollama_on_path():
-            print("Error: `ollama` command not found on PATH. Install Ollama or add it to PATH.")
-        elif not is_ollama_running():
-            started_pid = start_ollama()
-        else:
+        if _ollama_api_ready():
             print("Ollama is already running.")
+        elif is_ollama_running():
+            print("Ollama process found; waiting for its API...")
+            if wait_for_ollama(30.0):
+                print("Ollama is already running.")
+            else:
+                print("Ollama process is not responding; attempting to start it...")
+                started_pid = start_ollama()
+        elif not ollama_on_path():
+            print("Error: `ollama` command not found on PATH. Install Ollama or add it to PATH.")
+        else:
+            started_pid = start_ollama()
     except Exception as e:
         print(f"Could not check or start Ollama automatically: {e}")
 
@@ -147,269 +299,464 @@ def manage_ollama(no_close=False):
             print("--no-close: leaving the Ollama instance this script started running.")
 
 
-def get_local_ollama_models():
-    """Return (name, size, modified, status) rows from the Ollama API / CLI.
+def _format_modified(value):
+    """Normalise an Ollama modified_at value to 'YYYY-MM-DD HH:MM'."""
+    if not isinstance(value, str):
+        return "?" if value is None else str(value)
+    text = value.strip()
+    if not text:
+        return "?"
+    # ISO-8601, e.g. "2026-08-08T14:35:12.123456789Z".
+    if len(text) >= 16 and text[4] == "-" and text[7] == "-" and text[10] in "T ":
+        return f"{text[:10]} {text[11:16]}"
+    return text
 
-    status is one of "ok", "empty" (inventory obtained, no models) or "failed"
-    (inventory could not be obtained). Never collapse a failure into an empty
-    list.
+
+def _rows_from_models(models):
+    """Convert a list of Ollama model dicts into sorted inventory rows."""
+    if not isinstance(models, list):
+        raise ValueError("model list is not a list")
+    rows = []
+    for model in models:
+        if not isinstance(model, dict):
+            raise ValueError("model entry is not an object")
+        name = model.get("name") or model.get("model")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("model entry has no name")
+        name = name.strip()
+        size = model.get("size")
+        if size is None:
+            size = "?"
+        elif isinstance(size, (int, float)) and not isinstance(size, bool):
+            size = format_size(size)
+        else:
+            size = str(size)
+        rows.append((str(name), size, _format_modified(model.get("modified_at"))))
+    rows.sort(key=lambda r: r[0])
+    return rows
+
+
+def _parse_models_payload(payload):
+    """Validate an /api/tags or `ollama list --format json` payload.
+
+    Accepts both {"models": [...]} and a bare [...] list. Raises ValueError for
+    anything else, so a malformed payload is a failure rather than an empty
+    inventory.
+    """
+    if isinstance(payload, dict):
+        models = payload.get("models", [])
+    elif isinstance(payload, list):
+        models = payload
+    else:
+        raise ValueError("unexpected JSON payload type")
+    return _rows_from_models(models)
+
+
+SIZE_AT_START_RE = re.compile(
+    r"^(\d+(?:\.\d+)?\s*(?:B|KB|MB|GB|TB))\b", re.IGNORECASE
+)
+
+
+def parse_ollama_list_text(text):
+    """Parse the human-readable `ollama list` table into inventory rows.
+
+    Columns are NAME, ID, SIZE, MODIFIED. SIZE ("4.7 GB" or "-") and MODIFIED
+    ("2 days ago") contain spaces, so the digest is skipped and the size is
+    matched at the start of the remaining text.
+    """
+    rows = []
+    lines = (text or "").splitlines()
+    # Skip a header row if present ("NAME  ID  SIZE  MODIFIED").
+    if lines and "NAME" in lines[0].upper() and "SIZE" in lines[0].upper():
+        lines = lines[1:]
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parts = stripped.split()
+        if not parts or parts[0].upper() == "NAME":
+            continue
+        name = parts[0]
+        if not is_safe_model_name(name):
+            continue
+        # parts[1] is the digest for normal rows; skip it when present.
+        rest = parts[2:] if len(parts) >= 3 else parts[1:]
+        joined = " ".join(rest).strip()
+        size = "?"
+        modified = "?"
+        if rest and rest[0] == "-":
+            size = "-"
+            modified = " ".join(rest[1:]).strip() or "?"
+        else:
+            match = SIZE_AT_START_RE.match(joined)
+            if match:
+                size = re.sub(r"\s+", " ", match.group(1)).strip()
+                modified = joined[match.end():].strip() or "?"
+            elif joined:
+                # Unknown layout: keep the tail as opaque detail.
+                modified = joined
+        rows.append((name, size, modified))
+    rows.sort(key=lambda r: r[0])
+    return rows
+
+
+def _run_ollama(args):
+    """Run an ollama CLI command, returning stdout or None on any failure."""
+    try:
+        result = subprocess.run(
+            ["ollama", *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=SUBPROCESS_TIMEOUT,
+            creationflags=_creation_flags(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"Note: `ollama {' '.join(args)}` failed ({exc}).")
+        return None
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip().splitlines()
+        suffix = f": {detail[0]}" if detail else ""
+        print(f"Note: `ollama {' '.join(args)}` exited {result.returncode}{suffix}")
+        return None
+    return result.stdout or ""
+
+
+def get_local_ollama_models():
+    """Return (rows, status) for locally installed models.
+
+    rows are (name, size, modified) tuples; status is "ok", "empty" or
+    "failed". A failure is never collapsed into an empty list.
 
     Order of preference:
-      1. Ollama REST API (`/api/tags`) — most reliable, gives real size and
-         modified_at values.
-      2. `ollama list --format json` (newer Ollama CLIs).
-      3. `ollama list` text parsing (older CLIs like 0.32.x).
+      1. Ollama REST API (`/api/tags`) — no subprocess, structured fields.
+      2. `ollama list --format json` (newer CLIs).
+      3. `ollama list` text parsing (older CLIs such as 0.40.x).
     """
+    # 1) REST API. This works even when the CLI is not on PATH.
+    try:
+        resp = requests.get(OLLAMA_TAGS_URL, timeout=LOCAL_REQUEST_TIMEOUT)
+        if resp.status_code == 200:
+            return _inventory_result(_parse_models_payload(resp.json()), "REST API")
+        print(f"Note: Ollama API returned HTTP {resp.status_code}; "
+              "falling back to `ollama list`.")
+    except (requests.RequestException, ValueError) as exc:
+        print(f"Note: REST API unavailable ({exc}); falling back to `ollama list`.")
+
     if not ollama_on_path():
         print("Error: `ollama` command not found on PATH. Install Ollama or add it to PATH.")
-        return [], "failed"
+        return [], STATUS_FAILED
 
-    # 1) REST API — no subprocess, no column parsing.
-    try:
-        resp = requests.get("http://localhost:11434/api/tags", timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            rows = []
-            for model in data.get("models", []):
-                name = model.get("name") or "?"
-                size = model.get("size") or "?"
-                if isinstance(size, (int, float)):
-                    size = format_size(size)
-                modified = model.get("modified_at") or "?"
-                if isinstance(modified, str) and "T" in modified:
-                    # ISO timestamp -> "YYYY-MM-DD HH:MM" (drop subseconds/tz)
-                    modified = modified[:10] + " " + modified[11:16]
-                rows.append((name, size, modified))
-            rows.sort(key=lambda r: r[0])
-            status = "ok" if rows else "empty"
-            return rows, status
-    except (requests.RequestException, ValueError) as e:
-        print(f"Note: REST API unavailable ({e}); falling back to `ollama list`.")
+    # 2) Machine-readable JSON (newer CLIs). Older CLIs reject --format.
+    output = _run_ollama(["list", "--format", "json"])
+    if output is not None:
+        try:
+            rows = _parse_models_payload(json.loads(output or "{}"))
+            return _inventory_result(rows, "ollama list --format json")
+        except (json.JSONDecodeError, ValueError) as exc:
+            print(f"Note: invalid JSON from `ollama list --format json` ({exc}); "
+                  "falling back to text parsing.")
 
-    # 2) Machine-readable JSON form (newer CLIs).
-    try:
-        result = subprocess.run(["ollama", "list", "--format", "json"],
-                                capture_output=True, text=True,
-                                creationflags=subprocess.CREATE_NO_WINDOW)
-        if result.returncode == 0:
-            data = json.loads(result.stdout or "{}")
-            rows = []
-            for model in data.get("models", []):
-                name = model.get("name") or "?"
-                size = model.get("size") or "?"
-                if isinstance(size, (int, float)):
-                    size = format_size(size)
-                modified = model.get("modified_at") or "?"
-                rows.append((name, size, modified))
-            rows.sort(key=lambda r: r[0])
-            status = "ok" if rows else "empty"
-            return rows, status
-    except (subprocess.SubprocessError, json.JSONDecodeError, OSError) as e:
-        print(f"Note: `ollama list --format json` unavailable ({e}); "
-              "falling back to text parsing.")
+    # 3) Text parsing for older CLIs.
+    output = _run_ollama(["list"])
+    if output is None:
+        return [], STATUS_FAILED
+    return _inventory_result(parse_ollama_list_text(output), "ollama list")
 
-    # Fallback: parse `ollama list` text output. Columns are NAME ID SIZE
-    # MODIFIED, but SIZE ("4.7 GB") and MODIFIED ("2 days ago") are multi-token
-    # — so take the first token as the name and treat everything after it as
-    # opaque size/modified detail.
-    try:
-        result = subprocess.run(["ollama", "list"], capture_output=True, text=True,
-                                creationflags=subprocess.CREATE_NO_WINDOW)
-        if result.returncode != 0:
-            print(f"Error: `ollama list` failed (exit {result.returncode}).")
-            return [], "failed"
-        rows = []
-        for line in result.stdout.splitlines()[1:]:  # skip header
-            stripped = line.strip()
-            if not stripped:
-                continue
-            parts = stripped.split()
-            name = parts[0]
-            detail = " ".join(parts[1:]) or "?"
-            rows.append((name, detail, "?"))
-        rows.sort(key=lambda r: r[0])
-        status = "ok" if rows else "empty"
-        return rows, status
-    except Exception as e:
-        print(f"Error checking local ollama: {e}")
-        return [], "failed"
+
+def _inventory_result(rows, source):
+    """Build a (rows, status) pair, logging where the inventory came from."""
+    status = STATUS_OK if rows else STATUS_EMPTY
+    print(f"  local inventory source: {source}")
+    return rows, status
 
 
 # =============================================================================
 # Web scraper (based on unified-chat/unified_model_loading.py)
 # =============================================================================
-def http_get_with_backoff(url, *, params=None, max_retries=4, base_delay=1.5):
-    """GET a URL with retries and exponential backoff on transient errors/429.
+def _retry_after_seconds(value):
+    """Parse a Retry-After header (seconds or HTTP-date) into seconds."""
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    return max(0.0, (when - datetime.datetime.now(datetime.timezone.utc)).total_seconds())
 
-    Returns a requests.Response, or None if all attempts failed.
+
+def _backoff_delay(attempt, base_delay):
+    """Exponential backoff with jitter, capped at MAX_BACKOFF."""
+    return min(MAX_BACKOFF, base_delay * (2 ** (attempt - 1))) + random.uniform(0, 0.5)
+
+
+def http_get_with_backoff(url, *, params=None, headers=None, max_retries=4,
+                          base_delay=1.5, deadline=None):
+    """GET a URL with retries for transient failures.
+
+    Retries only timeouts, connection errors, HTTP 429 and 5xx. Other 4xx
+    responses (notably 404) are returned immediately so callers can tell a
+    missing page from a network failure. Returns None when retries are
+    exhausted or *deadline* (a time.monotonic() value) is reached.
     """
-    for attempt in range(max_retries):
+    request_headers = dict(HEADERS)
+    if headers:
+        request_headers.update(headers)
+
+    for attempt in range(1, max_retries + 1):
+        if deadline is not None and time.monotonic() >= deadline:
+            print("    crawl deadline reached; stopping")
+            return None
         try:
-            resp = requests.get(url, params=params, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-            if resp.status_code == 429:
-                retry_after = resp.headers.get("Retry-After")
-                try:
-                    wait = float(retry_after) if retry_after else base_delay * (2 ** attempt)
-                except ValueError:
-                    wait = base_delay * (2 ** attempt)
-                print(f"    HTTP 429 (rate limited); retrying in {wait:.0f}s "
-                      f"(attempt {attempt + 1}/{max_retries})")
-                time.sleep(wait)
-                continue
-            if resp.status_code >= 500:
-                wait = base_delay * (2 ** attempt)
-                print(f"    HTTP {resp.status_code}; retrying in {wait:.0f}s "
-                      f"(attempt {attempt + 1}/{max_retries})")
-                time.sleep(wait)
-                continue
-            resp.raise_for_status()
+            resp = requests.get(
+                url,
+                params=params,
+                headers=request_headers,
+                timeout=REQUEST_TIMEOUT,
+            )
+        except requests.RequestException as exc:
+            if attempt >= max_retries:
+                print(f"    request failed after {max_retries} attempt(s): {exc}")
+                return None
+            wait = _backoff_delay(attempt, base_delay)
+            print(f"    request error: {exc}; retrying in {wait:.1f}s "
+                  f"(attempt {attempt}/{max_retries})")
+            if deadline is not None and time.monotonic() + wait >= deadline:
+                print("    crawl deadline would be exceeded; stopping")
+                return None
+            time.sleep(wait)
+            continue
+
+        code = resp.status_code
+        if code < 400:
             return resp
-        except requests.Timeout:
-            wait = base_delay * (2 ** attempt)
-            print(f"    request timed out; retrying in {wait:.0f}s "
-                  f"(attempt {attempt + 1}/{max_retries})")
+        if code == 429 or code >= 500:
+            if attempt >= max_retries:
+                print(f"    HTTP {code} after {max_retries} attempt(s); giving up")
+                return resp
+            retry_after = _retry_after_seconds(resp.headers.get("Retry-After"))
+            if retry_after is not None:
+                wait = min(retry_after, MAX_RETRY_WAIT)
+            else:
+                wait = _backoff_delay(attempt, base_delay)
+            print(f"    HTTP {code}; retrying in {wait:.1f}s "
+                  f"(attempt {attempt}/{max_retries})")
+            if deadline is not None and time.monotonic() + wait >= deadline:
+                print("    crawl deadline would be exceeded; stopping")
+                return None
             time.sleep(wait)
-        except requests.RequestException as e:
-            if attempt == max_retries - 1:
-                return None  # exhausted retries — honor the "None on failure" contract
-            wait = base_delay * (2 ** attempt)
-            print(f"    request error: {e}; retrying in {wait:.0f}s "
-                  f"(attempt {attempt + 1}/{max_retries})")
-            time.sleep(wait)
+            continue
+        # Other client errors are permanent (e.g. 404 missing page).
+        print(f"    HTTP {code} for {url}")
+        return resp
     return None
+
+
+def _extract_base_models(soup):
+    """Return the set of model names linked from a search results page."""
+    names = set()
+    for link in soup.select('a[href^="/library/"]'):
+        href = (link.get("href") or "").split("?", 1)[0].split("#", 1)[0].rstrip("/")
+        if not href.startswith("/library/"):
+            continue
+        name = unquote(href[len("/library/"):])
+        # Skip tag pages (`/library/model:tag`) and any nested paths.
+        if "/" in name or ":" in name:
+            continue
+        if is_safe_model_name(name, allow_tag=False):
+            names.add(name)
+    return names
+
+
+def _page_has_more(soup):
+    """Return True when the results page advertises a next page."""
+    marker = soup.find(attrs={"data-has-more": True})
+    if marker is None:
+        return False
+    return str(marker.get("data-has-more", "")).strip().casefold() == "true"
+
+
+def _crawl_cloud_catalog(order):
+    """Crawl one ordered cloud catalog, following page=N pagination.
+
+    Returns (models, pages_fetched, pages_failed, truncated).
+    """
+    models = set()
+    pages_fetched = 0
+    pages_failed = 0
+    truncated = False
+    has_more = False
+    page = 1
+    deadline = time.monotonic() + MAX_CRAWL_SECONDS
+
+    while page <= MAX_SEARCH_PAGES:
+        if time.monotonic() >= deadline:
+            print("    crawl deadline reached; catalog may be incomplete")
+            truncated = True
+            break
+        params = {"c": "cloud"}
+        if order:
+            params["o"] = order
+        if page > 1:
+            params["page"] = page
+        headers = {"HX-Request": "true"} if page > 1 else None
+        print(f"  Fetching: {BASE_URL}/search?"
+              + "&".join(f"{k}={v}" for k, v in params.items()))
+        response = http_get_with_backoff(
+            f"{BASE_URL}/search", params=params, headers=headers, deadline=deadline
+        )
+        if response is None or response.status_code != 200:
+            if response is None and time.monotonic() >= deadline:
+                truncated = True
+                print(f"    crawl deadline reached on page {page}; catalog may be incomplete")
+            else:
+                pages_failed += 1
+                code = "no response" if response is None else f"HTTP {response.status_code}"
+                print(f"    page {page} failed ({code})")
+            break
+
+        pages_fetched += 1
+        found = _extract_base_models(_soup(response.text))
+        new = found - models
+        models |= found
+        has_more = _page_has_more(_soup(response.text))
+        print(f"    page {page}: {len(found)} model(s), {len(new)} new "
+              f"({len(models)} total, more: {'yes' if has_more else 'no'})")
+
+        if not has_more:
+            break
+        if not found:
+            # Claims more pages but returned nothing: stop rather than loop.
+            print("    page advertised more results but contained no models; stopping")
+            truncated = True
+            break
+        page += 1
+        time.sleep(0.5)
+    else:
+        # Exhausted MAX_SEARCH_PAGES while a next page was still advertised.
+        if has_more:
+            truncated = True
+            print(f"    stopped after {MAX_SEARCH_PAGES} pages; catalog may be incomplete")
+
+    return models, pages_fetched, pages_failed, truncated
 
 
 def get_base_models():
     """Get the list of base model names from the cloud search pages.
 
-    Walks the catalog page-by-page (`p=1, 2, ...`) until pages stop adding new
-    models or MAX_SEARCH_PAGES is reached. Returns (models, status) where status
-    is "ok", "empty" or "failed".
+    Follows the site's `page=N` pagination (with the `HX-Request` header it
+    expects) and stops when `data-has-more` is absent. Returns
+    (models, status, pages_fetched, pages_failed) where status is "ok",
+    "empty", "truncated" or "failed".
 
-    Any page that fails mid-crawl makes the inventory incomplete, so the result
-    is "failed" (never "ok") whenever pages_failed > 0 — a partial list is not
-    a complete inventory.
+    A page failure makes the inventory incomplete, so status is "failed" —
+    never "ok" — whenever pages_failed > 0.
     """
-    base_models = set()
-    pages_fetched = 0
-    pages_failed = 0
     try:
-        # "newest" order first, then the default order — both share pagination.
-        for order in ("newest", None):
-            page = 1
-            empty_streak = 0
-            while page <= MAX_SEARCH_PAGES:
-                params = {"c": "cloud"}
-                if order:
-                    params["o"] = order
-                if page > 1:
-                    params["p"] = page
-                url = f"{BASE_URL}/search"
-                print(f"  Fetching: {url}?{'&'.join(f'{k}={v}' for k, v in params.items())}"
-                      if page > 1 else f"  Fetching: {SEARCH_URL}")
-                try:
-                    response = http_get_with_backoff(url, params=params)
-                    if response is None:
-                        pages_failed += 1
-                        print("    giving up on this page after retries")
-                        break
-                    pages_fetched += 1
-                    soup = BeautifulSoup(response.text, "html.parser")
-                    found = 0
-                    for link in soup.find_all("a", href=re.compile(r"^/library/")):
-                        model_name = link.get("href", "").replace("/library/", "")
-                        if model_name and model_name not in base_models:
-                            base_models.add(model_name)
-                            found += 1
-                    print(f"    page {page}: {found} new base model(s) "
-                          f"({len(base_models)} total)")
-                    # Stop after 2 consecutive empty pages (tolerates a single
-                    # gap in the catalog without treating it as the end).
-                    if found == 0:
-                        empty_streak += 1
-                        if empty_streak >= 2:
-                            break
-                    else:
-                        empty_streak = 0
-                    time.sleep(0.8)
-                    page += 1
-                except Exception as e:
-                    pages_failed += 1
-                    print(f"    Warning fetching page {page}: {e}")
-                    break
-            if base_models:
-                break  # newest order already gave us the catalog
+        models, pages_fetched, pages_failed, truncated = _crawl_cloud_catalog("newest")
+        if not models and pages_failed == 0 and not truncated:
+            # Fall back to the default ordering if "newest" was empty.
+            print("  No models in newest order; trying the default order...")
+            fallback = _crawl_cloud_catalog(None)
+            models2, pages2, failed2, truncated2 = fallback
+            models |= models2
+            pages_fetched += pages2
+            pages_failed += failed2
+            truncated = truncated or truncated2
     except Exception as e:
         print(f"Error fetching base models: {e}")
-        return [], "failed", pages_fetched, pages_failed
+        return [], STATUS_FAILED, 0, 1
 
     if pages_failed > 0:
-        status = "failed"
-    elif base_models:
-        status = "ok"
+        status = STATUS_FAILED
+    elif truncated:
+        status = STATUS_TRUNCATED
+    elif models:
+        status = STATUS_OK
     else:
-        status = "empty"
-    return list(base_models), status, pages_fetched, pages_failed
+        status = STATUS_EMPTY
+    return sorted(models), status, pages_fetched, pages_failed
 
 
 def get_cloud_tags_for_model(model_name):
-    """Get all cloud tags (ending with :cloud) for a specific model."""
-    for attempt in range(3):
-        try:
-            url = f"{BASE_URL}/library/{model_name}/tags"
-            response = http_get_with_backoff(url)
-            if response is None:
-                print(f"    giving up on tags for {model_name}")
-                return None  # distinguish "no cloud tags" from "page failed"
-            soup = BeautifulSoup(response.text, "html.parser")
+    """Return this model's :cloud tags, [] if it has none, or None on failure.
 
-            cloud_tags = set()
+    Only tags whose base name exactly matches *model_name* are accepted, so
+    tags from a similarly named model (e.g. `foo-bar` vs `foo`) can never leak
+    into the inventory.
+    """
+    if not is_safe_model_name(model_name, allow_tag=False):
+        print(f"  skipping unsafe model name: {model_name!r}")
+        return None
 
-            # Prefer the hidden <input class="command" value="model:tag"> rows,
-            # which list every tag for the model.
-            for elem in soup.select('input[class~="command"]'):
-                value = elem.get("value", "").strip()
-                if value and CLOUD_TAG_RE.match(value) \
-                        and value.lower().startswith(model_name.lower()):
-                    cloud_tags.add(value)
+    url = f"{BASE_URL}/library/{quote(model_name)}/tags"
+    for attempt in (1, 2):
+        response = http_get_with_backoff(url, max_retries=3)
+        if response is None:
+            print(f"    giving up on tags for {model_name}")
+            return None
+        if response.status_code == 404:
+            # No tags page for this model: it simply has no cloud variants.
+            print("  no tags page (HTTP 404)")
+            return []
+        if response.status_code != 200:
+            print(f"  tags page HTTP {response.status_code}")
+            if attempt == 1:
+                time.sleep(1.0)
+                continue
+            return None
 
-            # Fall back to scraping tag text/anchors if the input rows were absent.
-            if not cloud_tags:
-                page_text = soup.get_text()
-                patterns = [
-                    rf"{re.escape(model_name)}:[\w\d.-]*cloud",
-                    rf"{re.escape(model_name)}:cloud",
-                    r"[\w\d.-]+:[\w\d.-]*cloud",
-                ]
-                for pattern in patterns:
-                    for match in re.findall(pattern, page_text, re.IGNORECASE):
-                        if match.lower().startswith(model_name.lower()) and match.lower().endswith("cloud"):
-                            cloud_tags.add(match)
+        soup = _soup(response.text)
+        command_rows = soup.select('input[class~="command"]')
+        cloud_tags = set()
+        for elem in command_rows:
+            value = (elem.get("value") or "").strip()
+            if CLOUD_TAG_RE.match(value) and tag_belongs_to_model(value, model_name):
+                cloud_tags.add(value)
 
-            # A tags page with no command rows at all is suspicious; retry once.
-            if not soup.select('input[class~="command"]'):
-                raise RuntimeError("tags page returned no tag rows")
-            return sorted(cloud_tags)
-        except Exception as e:
-            print(f"  Warning fetching tags for {model_name} (attempt {attempt + 1}/3): {e}")
-            time.sleep(1.5 * (attempt + 1))
+        if not command_rows:
+            # Layout fallback: look for tag anchors/text mentioning this model.
+            pattern = re.compile(
+                rf"(?<![A-Za-z0-9._+-]){re.escape(model_name)}:"
+                r"[A-Za-z0-9._+-]*cloud",
+                re.IGNORECASE | re.ASCII,
+            )
+            for match in pattern.findall(soup.get_text(" ")):
+                if CLOUD_TAG_RE.match(match) and tag_belongs_to_model(match, model_name):
+                    cloud_tags.add(match)
+            if not cloud_tags and attempt == 1:
+                print("  tags page had no tag rows; retrying once")
+                time.sleep(1.0)
+                continue
+        return sorted(cloud_tags)
     return None
 
 
 def scrape_web_cloud_models():
     """Return (models, status, stats) — deduplicated sorted list of web :cloud tags.
 
-    status is "ok", "empty" or "failed"; stats carries integrity counters.
+    status is "ok", "empty", "truncated" or "failed"; stats carries integrity
+    counters.
     """
     print("\n--- Scraping web cloud models from ollama.com ---")
     print("Step 1: Fetching base cloud models...")
     base_models, status, pages_fetched, pages_failed = get_base_models()
-    if status == "failed":
-        print("FAILED to fetch base models (network/HTTP errors) — treating this "
-              "as an inventory failure, not an empty list.")
-        return [], "failed", {"pages_fetched": pages_fetched, "pages_failed": pages_failed,
-                              "base_models": 0, "duplicates": 0,
-                              "tags_found": 0, "failed_pages": pages_failed}
+    if status in (STATUS_FAILED, STATUS_TRUNCATED):
+        print(f"FAILED to fetch the complete base-model catalog (status: {status}) — "
+              "treating this as an inventory failure, not an empty list.")
+        return [], status, {"pages_fetched": pages_fetched, "pages_failed": pages_failed,
+                            "base_models": len(base_models), "duplicates": 0,
+                            "tags_found": 0, "failed_pages": pages_failed}
 
     print(f"Step 2: Found {len(base_models)} base models. Fetching cloud tags...\n")
     all_cloud_models = set()  # set => no duplicates can ever be added
@@ -437,7 +784,7 @@ def scrape_web_cloud_models():
         time.sleep(0.5)
 
     # Final safety net: deduplicate case-insensitively (e.g. Cloud vs cloud).
-    final = sorted(set(t.lower() for t in all_cloud_models))
+    final = sorted(set(t.casefold() for t in all_cloud_models))
     if len(final) != len(all_cloud_models):
         duplicate_count += len(all_cloud_models) - len(final)
         print(f"  (collapsed {len(all_cloud_models) - len(final)} case-variant duplicate(s))")
@@ -445,8 +792,13 @@ def scrape_web_cloud_models():
     # A failed tags page means we couldn't read that model's full tag list, so
     # the inventory is incomplete — report FAILED, not ok.
     if failed_models > 0:
-        status = "failed"
+        status = STATUS_FAILED
         print(f"  {failed_models} model tag page(s) FAILED — inventory is incomplete.")
+    elif final:
+        status = STATUS_OK
+    else:
+        status = STATUS_EMPTY
+        print("  No cloud tags found (inventory is empty).")
 
     stats = {
         "pages_fetched": pages_fetched,
@@ -471,9 +823,9 @@ def ensure_logs_dir():
 
 
 def write_list_file(path, items):
-    with open(path, "w", encoding="utf-8") as f:
-        for item in items:
-            f.write(item + "\n")
+    """Atomically write one item per line (UTF-8, LF)."""
+    text = "".join(f"{item}\n" for item in items)
+    atomic_write_text(path, text, encoding="utf-8", newline="\n")
 
 
 def write_run_log(local_rows, local_status, web_models, web_status, web_stats, log_path,
@@ -555,11 +907,17 @@ def write_run_log(local_rows, local_status, web_models, web_status, web_stats, l
     lines.append("INTEGRITY CHECK")
     lines.append("-" * 40)
     problems = []
-    if web_status == "failed":
+    if web_status == STATUS_FAILED:
         problems.append("WEB inventory FAILED — results may be incomplete")
-    if local_status == "failed":
+    if web_status == STATUS_TRUNCATED:
+        problems.append("WEB inventory TRUNCATED — results are incomplete")
+    if web_status == STATUS_EMPTY:
+        problems.append("WEB inventory EMPTY — no cloud models found")
+    if local_status == STATUS_FAILED:
         problems.append("LOCAL inventory FAILED — results may be incomplete")
-    if local_status == "skipped":
+    if local_status == STATUS_TRUNCATED:
+        problems.append("LOCAL inventory TRUNCATED — results are incomplete")
+    if local_status == STATUS_SKIPPED:
         problems.append("LOCAL inventory SKIPPED (--web-only) — local side is unknown")
     if not problems:
         problems.append("OK — both inventories obtained")
@@ -569,15 +927,23 @@ def write_run_log(local_rows, local_status, web_models, web_status, web_stats, l
     lines.append("")
     lines.append("END OF LOG")
 
-    with open(log_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+    atomic_write_text(log_path, "\n".join(lines) + "\n", encoding="utf-8")
 
 
 def write_run_script(extra_models, pull_only=False):
     """Write run_cloud_models.bat that runs/pulls every web-only model locally.
 
-    Returns True if the file was (re)written, False if it was skipped.
+    Returns True if the file was (re)written, False if it was skipped. An
+    empty model list never overwrites an existing script.
     """
+    safe_models = [m for m in extra_models if is_safe_model_name(m)]
+    skipped = len(extra_models) - len(safe_models)
+    if skipped:
+        print(f"  WARNING: skipped {skipped} unsafe model name(s) when writing the script.")
+    if not safe_models:
+        print("  No web-only models to write; leaving the existing run script unchanged.")
+        return False
+
     command = "pull" if pull_only else "run"
     action_comment = ("REM and starts a chat session." if not pull_only
                       else "REM and downloads it. No chat session is started.")
@@ -594,7 +960,7 @@ def write_run_script(extra_models, pull_only=False):
         switch_comment,
         "",
     ]
-    for model in extra_models:
+    for model in safe_models:
         lines.append(f"ollama {command} {model}")
     lines.append("")
     lines.append("REM All done. Press any key to close...")
@@ -602,8 +968,12 @@ def write_run_script(extra_models, pull_only=False):
     # newline="" disables Windows text-mode translation, so the explicit \r\n
     # stays as a single CRLF instead of becoming \r\r\n (which renders as a
     # blank line after every line in cmd.exe).
-    with open(RUN_SCRIPT_PATH, "w", encoding="utf-8", newline="") as f:
-        f.write("\r\n".join(lines) + "\r\n")
+    atomic_write_text(
+        RUN_SCRIPT_PATH,
+        "\r\n".join(lines) + "\r\n",
+        encoding="utf-8",
+        newline="",
+    )
     return True
 
 
@@ -617,7 +987,7 @@ def print_diff(local_rows, local_status, web_models, web_status):
     common = sorted(local_set & web_set)
 
     print("\n" + "=" * 72)
-    print("MODEL COMPARISON — web (:cloud) vs local (ollama list)")
+    print("MODEL COMPARISON — web (:cloud) vs local inventory")
     print("=" * 72)
     print(f"Total web cloud models : {len(web_set)}")
     print(f"Total local models     : {len(local_set)}")
@@ -625,12 +995,22 @@ def print_diff(local_rows, local_status, web_models, web_status):
     print(f"Extra on web           : {len(extra_web)}")
     print(f"Extra on local         : {len(extra_local)}")
 
-    if web_status == "failed":
+    if web_status == STATUS_FAILED:
         print("\n  WARNING: WEB inventory FAILED — the web-only list above may be")
         print("  incomplete. Check the network and re-run before trusting this diff.")
-    if local_status == "failed":
+    elif web_status == STATUS_TRUNCATED:
+        print("\n  WARNING: WEB inventory was TRUNCATED (page/time limit) — the")
+        print("  web-only list above is incomplete. Re-run before trusting this diff.")
+    elif web_status == STATUS_EMPTY:
+        print("\n  WARNING: WEB inventory is EMPTY — no cloud models were found.")
+    if local_status == STATUS_FAILED:
         print("\n  WARNING: LOCAL inventory FAILED — `ollama list` could not be read.")
         print("  The local side is treated as unknown, not empty.")
+    elif local_status == STATUS_TRUNCATED:
+        print("\n  WARNING: LOCAL inventory was TRUNCATED — the local side is incomplete.")
+    elif local_status == STATUS_SKIPPED:
+        print("\n  NOTE: LOCAL inventory SKIPPED (--web-only) — every web model is")
+        print("  shown as 'extra on web' because the local side is unknown.")
 
     print("\n--- Extra on WEB (not installed locally) ---")
     if extra_web:
@@ -663,6 +1043,11 @@ def print_diff(local_rows, local_status, web_models, web_status):
     return extra_web
 
 
+def _inventory_is_trusted(status):
+    """True when an inventory was obtained completely (ok or genuinely empty)."""
+    return status in (STATUS_OK, STATUS_EMPTY)
+
+
 def main(argv=None):
     import argparse
     parser = argparse.ArgumentParser(
@@ -674,10 +1059,11 @@ def main(argv=None):
     parser.add_argument("--pull-only", action="store_true",
                         help="Generate run_cloud_models.bat with `ollama pull` "
                              "instead of `ollama run`.")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = parser.parse_args(argv)
 
     print("=" * 72)
-    print("OLLAMA SYNC — web :cloud models vs local install")
+    print(f"OLLAMA SYNC {__version__} — web :cloud models vs local install")
     print("=" * 72)
 
     ensure_outputs_dir()
@@ -686,10 +1072,10 @@ def main(argv=None):
     if args.web_only:
         print("\n[web-only mode] Skipping local Ollama management/list.")
         local_rows = []
-        local_status = "skipped"  # deliberately not checked, not "empty"
+        local_status = STATUS_SKIPPED  # deliberately not checked, not "empty"
     else:
         with manage_ollama(no_close=args.no_close):
-            print("\n--- Reading local models (ollama list) ---")
+            print("\n--- Reading local models ---")
             local_rows, local_status = get_local_ollama_models()
             print(f"Found {len(local_rows)} local model(s) "
                   f"(inventory: {local_status}).")
@@ -697,17 +1083,35 @@ def main(argv=None):
     web_models, web_status, web_stats = scrape_web_cloud_models()
     print(f"\nFound {len(web_models)} web cloud model(s) (inventory: {web_status}).")
 
-    write_list_file(CLOUD_TXT, web_models)
-    write_list_file(LOCAL_TXT, [name for name, _, _ in local_rows])
-    print(f"\nSaved web cloud models -> {CLOUD_TXT}")
-    print(f"Saved local models     -> {LOCAL_TXT}")
+    if _inventory_is_trusted(web_status):
+        write_list_file(CLOUD_TXT, web_models)
+        print(f"\nSaved web cloud models -> {CLOUD_TXT}")
+    else:
+        print(f"\nLeft {CLOUD_TXT} unchanged (web inventory: {web_status}).")
+
+    if _inventory_is_trusted(local_status):
+        write_list_file(LOCAL_TXT, [name for name, _, _ in local_rows])
+        print(f"Saved local models     -> {LOCAL_TXT}")
+    elif local_status == STATUS_SKIPPED:
+        print(f"Left {LOCAL_TXT} unchanged (local inventory skipped).")
+    else:
+        print(f"Left {LOCAL_TXT} unchanged (local inventory: {local_status}).")
 
     extra_web = print_diff(local_rows, local_status, web_models, web_status)
 
-    if args.pull_only:
-        # --pull-only is an explicit "regenerate as pull" request — write it.
+    # Only generate a script from two complete inventories. A failed, truncated
+    # or skipped inventory would otherwise produce a wrong (possibly huge) list.
+    inventories_ready = web_status == STATUS_OK and local_status in (STATUS_OK, STATUS_EMPTY)
+    if not inventories_ready:
+        print("\nSkipping run_cloud_models.bat update: both inventories must be "
+              "complete (web: ok, local: ok/empty).")
+        wrote_script = False
+    elif args.pull_only:
+        # --pull-only is an explicit "regenerate as pull" request.
         wrote_script = write_run_script(extra_web, pull_only=True)
-        print(f"\nWrote run script -> {RUN_SCRIPT_PATH} ({len(extra_web)} model(s)) [pull-only]")
+        if wrote_script:
+            print(f"\nWrote run script -> {RUN_SCRIPT_PATH} "
+                  f"({len(extra_web)} model(s)) [pull-only]")
     else:
         # Show exactly which models will be added, then ask before overwriting.
         print("\n" + "=" * 72)
@@ -717,7 +1121,7 @@ def main(argv=None):
             for m in extra_web:
                 print(f"  + {m}")
         else:
-            print("  (no new web-only models — script would contain no model lines)")
+            print("  (no new web-only models — the script will not be changed)")
         try:
             answer = input(f"\nRegenerate run_cloud_models.bat with these "
                            f"{len(extra_web)} web-only model(s)? "
@@ -726,22 +1130,31 @@ def main(argv=None):
             answer = "n"
         if answer in ("y", "yes"):
             wrote_script = write_run_script(extra_web, pull_only=False)
-            print(f"Wrote run script -> {RUN_SCRIPT_PATH} ({len(extra_web)} model(s))")
+            if wrote_script:
+                print(f"Wrote run script -> {RUN_SCRIPT_PATH} ({len(extra_web)} model(s))")
         else:
             wrote_script = False
             print(f"Skipped updating {RUN_SCRIPT_PATH} (existing script left as-is).")
 
-    log_path = os.path.join(LOGS_DIR, f"ollama_sync_{timestamp_str()}.log")
+    log_path = unique_path(os.path.join(LOGS_DIR, f"ollama_sync_{timestamp_str()}.log"))
     write_run_log(local_rows, local_status, web_models, web_status, web_stats, log_path,
                   script_written=wrote_script)
     print(f"Wrote run log      -> {log_path}")
 
+    # Exit code: 0 = complete run, 1 = incomplete/unusable inventory.
+    if web_status not in (STATUS_OK, STATUS_EMPTY):
+        print("\nFinished with an incomplete WEB inventory.")
+        return 1
+    if local_status not in (STATUS_OK, STATUS_EMPTY, STATUS_SKIPPED):
+        print("\nFinished with an incomplete LOCAL inventory.")
+        return 1
     print("\nDone.")
+    return 0
 
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main())
     except KeyboardInterrupt:
         print("\n\nInterrupted by user.")
         sys.exit(130)

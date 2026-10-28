@@ -7,9 +7,11 @@ closed again only if this script started it).
 
 Usage:
   python test_models.py [--only <model>] [--limit N] [--parallel N] [--no-close]
+                        [--version]
   test_models.bat           (same)
 """
 
+import io
 import os
 import sys
 import time
@@ -21,7 +23,7 @@ import requests
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ollama_sync as sync
 
-OLLAMA_API = "http://localhost:11434"
+OLLAMA_API = sync.OLLAMA_HOST
 PROMPT = "hi"
 # A model that hangs instead of responding should be treated as not working
 # rather than blocking the whole test run forever.
@@ -31,20 +33,34 @@ MODEL_START_TIMEOUT = 300  # first load / cold start can be slow
 # ---------------------------------------------------------------------------
 # Colored console output (Windows 10+ cmd.exe supports ANSI via VT processing)
 # ---------------------------------------------------------------------------
-_USE_COLOR = True
-try:
-    import ctypes
-    kernel32 = ctypes.windll.kernel32
-    # Enable ANSI escape sequences for this console (ENABLE_VIRTUAL_TERMINAL_PROCESSING)
-    kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
-except Exception:
-    _USE_COLOR = False
+def _stdout_supports_color():
+    """Enable ANSI colors only on a real terminal that can handle them."""
+    if os.environ.get("NO_COLOR") is not None:
+        return False
+    if not getattr(sys.stdout, "isatty", lambda: False)():
+        return False
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        return bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004))
+    except Exception:
+        return False
+
+
+_USE_COLOR = _stdout_supports_color()
 
 # Force UTF-8 output so ✓/✗/⚠/– symbols survive on Windows consoles regardless
 # of the system codepage (cp1252 etc.).
 try:
-    sys.stdout.reconfigure(encoding="utf-8")
-    sys.stderr.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
 
@@ -106,7 +122,15 @@ def classify_http_error(status_code, body):
         if "subscription" in lowered or "upgrade" in lowered or "requires" in lowered:
             return STATUS_SUBSCRIPTION, "HTTP 403 — model requires an Ollama subscription"
         return STATUS_ERROR, f"HTTP {status_code} — access denied"
+    if status_code == 404:
+        return STATUS_ERROR, "HTTP 404 — model not found (pull it and retry)"
+    if status_code == 429:
+        return STATUS_ERROR, "HTTP 429 — rate limited; retry later"
     return STATUS_ERROR, f"HTTP {status_code}: {text[:120]}"
+
+
+def _snippet(text, limit=120):
+    return (text or "").strip().replace("\n", " ")[:limit]
 
 
 def run_model_test(model, prompt=PROMPT):
@@ -115,9 +139,13 @@ def run_model_test(model, prompt=PROMPT):
     Uses a generous MODEL_START_TIMEOUT so a slow cold-start isn't misclassified
     as a timeout, then falls back to the faster REQUEST_TIMEOUT for retries.
     elapsed_s is the TOTAL time across attempts (including retries).
+
+    Reasoning models may put their whole reply in `thinking` with an empty
+    `response` (and `done_reason="length"`); that is a valid response, not a
+    failure, so it is reported as functional.
     """
     timeout = MODEL_START_TIMEOUT
-    total_start = time.time()
+    total_start = time.monotonic()
     for attempt in range(2):
         try:
             payload = {
@@ -128,13 +156,31 @@ def run_model_test(model, prompt=PROMPT):
             }
             resp = requests.post(f"{OLLAMA_API}/api/generate", json=payload,
                                  timeout=timeout)
-            elapsed = time.time() - total_start
+            elapsed = time.monotonic() - total_start
             if resp.status_code == 200:
-                data = resp.json()
-                text = (data.get("response") or "").strip()
-                snippet = text[:120].replace("\n", " ")
-                if not text:
-                    return STATUS_NO_RESPONSE, "", elapsed, "empty response"
+                try:
+                    data = resp.json()
+                except ValueError:
+                    return STATUS_ERROR, "", elapsed, "invalid JSON response"
+                if not isinstance(data, dict):
+                    return STATUS_ERROR, "", elapsed, "unexpected JSON response"
+                text = data.get("response")
+                if not isinstance(text, str):
+                    text = "" if text is None else str(text)
+                text = text.strip()
+                thinking = data.get("thinking") or ""
+                if not isinstance(thinking, str):
+                    thinking = str(thinking)
+                thinking = thinking.strip()
+                if text:
+                    snippet = _snippet(text)
+                elif thinking:
+                    snippet = "[reasoning] " + _snippet(thinking, 100)
+                else:
+                    reason = data.get("done_reason")
+                    detail = f"empty response (done_reason={reason})" if reason \
+                        else "empty response"
+                    return STATUS_NO_RESPONSE, "", elapsed, detail
                 if elapsed > 60:
                     return STATUS_SLOW, snippet, elapsed, None
                 return STATUS_OK, snippet, elapsed, None
@@ -144,10 +190,13 @@ def run_model_test(model, prompt=PROMPT):
             if attempt == 0:
                 timeout = REQUEST_TIMEOUT  # already waited for cold start; retry briskly
                 continue
-            elapsed = time.time() - total_start
+            elapsed = time.monotonic() - total_start
             return STATUS_NO_RESPONSE, "", elapsed, "timeout"
+        except requests.RequestException as e:
+            elapsed = time.monotonic() - total_start
+            return STATUS_ERROR, "", elapsed, str(e)
         except Exception as e:
-            elapsed = time.time() - total_start
+            elapsed = time.monotonic() - total_start
             return STATUS_ERROR, "", elapsed, str(e)
 
 
@@ -167,7 +216,11 @@ def run_all_tests(models, parallel=1):
     if parallel <= 1:
         for i, model in enumerate(models, 1):
             print(f"[{paint_bar(i, len(models), BLUE)}] {paint(model, BOLD)}{DIM} ...{RESET}", end="", flush=True)
-            model, result = run_one(model)
+            try:
+                model, result = run_one(model)
+            except Exception as exc:
+                result = {"status": STATUS_ERROR, "snippet": "", "elapsed": 0.0,
+                          "error": f"worker failed: {exc}"}
             results[model] = result
             sym, color = status_symbol(result["status"])
             print(f" {paint(sym, color)} {paint(result['status'], color)} ({format_elapsed(result['elapsed'])})")
@@ -179,7 +232,12 @@ def run_all_tests(models, parallel=1):
     with ThreadPoolExecutor(max_workers=parallel) as pool:
         futures = {pool.submit(run_one, m): m for m in models}
         for i, future in enumerate(as_completed(futures), 1):
-            model, result = future.result()
+            model = futures[future]
+            try:
+                model, result = future.result()
+            except Exception as exc:
+                result = {"status": STATUS_ERROR, "snippet": "", "elapsed": 0.0,
+                          "error": f"worker failed: {exc}"}
             results[model] = result
             sym, color = status_symbol(result["status"])
             print(f"[{paint_bar(i, len(models), BLUE)}] {paint(model, BOLD)} "
@@ -206,25 +264,30 @@ def main(argv=None):
                         help="Test N models concurrently (default 1; be mindful of VRAM).")
     parser.add_argument("--no-close", action="store_true",
                         help="Keep Ollama running even if this script started it.")
+    parser.add_argument("--version", action="version",
+                        version=f"%(prog)s {sync.__version__}")
     args = parser.parse_args(argv)
     only = args.only
     limit = args.limit
     no_close = args.no_close
     parallel = max(1, args.parallel or 1)
 
+    if limit is not None and limit < 0:
+        parser.error("--limit must be zero or greater")
+
     if parallel > 4:
         print(paint("WARNING: --parallel {} is high — large models run concurrently "
                     "and can exhaust VRAM. Consider lowering it.".format(parallel), YELLOW))
 
     print("=" * 72)
-    print("OLLAMA MODEL TEST — one 'hi' prompt per installed model")
+    print(f"OLLAMA MODEL TEST {sync.__version__} — one 'hi' prompt per installed model")
     print("=" * 72)
 
     sync.ensure_logs_dir()
 
     with sync.manage_ollama(no_close=no_close):
         rows, status = sync.get_local_ollama_models()
-        if status == "failed":
+        if status not in (sync.STATUS_OK, sync.STATUS_EMPTY, sync.STATUS_SKIPPED):
             print(paint("\n✗ LOCAL MODEL INVENTORY FAILED", RED))
             print("  Cannot safely run model tests — check that Ollama is running")
             print("  and that `ollama list` works, then re-run.")
@@ -290,60 +353,64 @@ def main(argv=None):
     print_group("AVAILABLE BUT NOT INSTALLED", unavailable, MAGENTA)
 
     # ---- write log ----
-    log_path = os.path.join(sync.LOGS_DIR, f"model_test_{sync.timestamp_str()}.log")
-    with open(log_path, "w", encoding="utf-8") as f:
-        f.write("=" * 72 + "\n")
-        f.write("OLLAMA MODEL TEST LOG\n")
-        f.write(f"Timestamp: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Prompt   : {PROMPT}\n")
-        f.write(f"Parallel : {parallel}\n")
-        f.write(f"Models   : {len(results)}\n")
-        f.write("=" * 72 + "\n\n")
+    log_path = sync.unique_path(
+        os.path.join(sync.LOGS_DIR, f"model_test_{sync.timestamp_str()}.log"))
+    log = io.StringIO()
+    log.write("=" * 72 + "\n")
+    log.write("OLLAMA MODEL TEST LOG\n")
+    log.write(f"Timestamp: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    log.write(f"Prompt   : {PROMPT}\n")
+    log.write(f"Parallel : {parallel}\n")
+    log.write(f"Models   : {len(results)}\n")
+    log.write("=" * 72 + "\n\n")
 
-        f.write("PER-MODEL RESULTS\n")
-        f.write("-" * 40 + "\n")
-        for m, r in sorted(results.items()):
-            f.write(f"{m}\n")
-            f.write(f"  status : {r['status']}\n")
-            f.write(f"  elapsed: {format_elapsed(r['elapsed'])}\n")
+    log.write("PER-MODEL RESULTS\n")
+    log.write("-" * 40 + "\n")
+    for m, r in sorted(results.items()):
+        log.write(f"{m}\n")
+        log.write(f"  status : {r['status']}\n")
+        log.write(f"  elapsed: {format_elapsed(r['elapsed'])}\n")
+        if r["snippet"]:
+            log.write(f"  reply  : {r['snippet']}\n")
+        if r["error"]:
+            log.write(f"  error  : {r['error']}\n")
+        log.write("\n")
+
+    def log_group(title, group):
+        log.write(f"{title} ({len(group)}):\n")
+        if not group:
+            log.write("  (none)\n")
+            return
+        for m, r in sorted(group.items()):
+            sym, _ = status_symbol(r["status"])
+            extra = ""
+            if r["status"] == STATUS_SLOW:
+                extra = f"  ({format_elapsed(r['elapsed'])})"
+            log.write(f"  {sym} {m}{extra}\n")
             if r["snippet"]:
-                f.write(f"  reply  : {r['snippet']}\n")
-            if r["error"]:
-                f.write(f"  error  : {r['error']}\n")
-            f.write("\n")
+                log.write(f"      reply: {r['snippet']}\n")
+        log.write("\n")
 
-        def log_group(title, group, color=None):
-            f.write(f"{title} ({len(group)}):\n")
-            if not group:
-                f.write("  (none)\n")
-                return
-            for m, r in sorted(group.items()):
-                sym, _ = status_symbol(r["status"])
-                extra = ""
-                if r["status"] == STATUS_SLOW:
-                    extra = f"  ({format_elapsed(r['elapsed'])})"
-                f.write(f"  {sym} {m}{extra}\n")
-                if r["snippet"]:
-                    f.write(f"      reply: {r['snippet']}\n")
-            f.write("\n")
+    log_group("FUNCTIONAL & READY TO USE", {**functional, **slow})
+    log_group("AVAILABLE BUT NEEDS SUBSCRIPTION/UPGRADE", subscription)
+    log_group("RETIRED (no longer served)", retired)
+    log_group("NOT WORKING", {**no_resp, **errors})
+    log_group("AVAILABLE BUT NOT INSTALLED", unavailable)
 
-        log_group("FUNCTIONAL & READY TO USE", {**functional, **slow})
-        log_group("AVAILABLE BUT NEEDS SUBSCRIPTION/UPGRADE", subscription)
-        log_group("RETIRED (no longer served)", retired)
-        log_group("NOT WORKING", {**no_resp, **errors})
-        log_group("AVAILABLE BUT NOT INSTALLED", unavailable)
-
-        f.write("=" * 72 + "\n")
-        f.write("SUMMARY\n")
-        f.write(f"Functional ready to use   : {len(functional)}\n")
-        f.write(f"Functional (slow)         : {len(slow)}\n")
-        f.write(f"Needs subscription/upgrade: {len(subscription)}\n")
-        f.write(f"Retired (410 gone)        : {len(retired)}\n")
-        f.write(f"Not working (no response) : {len(no_resp)}\n")
-        f.write(f"Not working (error)       : {len(errors)}\n")
-        f.write(f"Unavailable (not installed): {len(unavailable)}\n")
-        f.write(f"Total tested              : {len(results)}\n")
-        f.write("END OF LOG\n")
+    log.write("=" * 72 + "\n")
+    log.write("SUMMARY\n")
+    log.write(f"Functional ready to use   : {len(functional)}\n")
+    log.write(f"Functional (slow)         : {len(slow)}\n")
+    log.write(f"Needs subscription/upgrade: {len(subscription)}\n")
+    log.write(f"Retired (410 gone)        : {len(retired)}\n")
+    log.write(f"Not working (no response) : {len(no_resp)}\n")
+    log.write(f"Not working (error)       : {len(errors)}\n")
+    log.write(f"Unavailable (not installed): {len(unavailable)}\n")
+    log.write(f"Total tested              : {len(results)}\n")
+    log.write("END OF LOG\n")
+    # utf-8-sig adds a BOM so Windows Notepad detects UTF-8; atomic_write_text
+    # guarantees a crash mid-write cannot leave a truncated log behind.
+    sync.atomic_write_text(log_path, log.getvalue(), encoding="utf-8-sig")
     print(f"\nWrote test log -> {log_path}")
     return 0
 
